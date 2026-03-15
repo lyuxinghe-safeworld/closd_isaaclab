@@ -39,15 +39,32 @@ An MLP policy (PPO-trained on AMASS) that:
 
 The tracker expects `RobotState` from `MotionLib.get_motion_state()`, which provides all fields. Unlike CLoSD's position-only controller, it was trained with full rotation/DOF observations.
 
+### Quaternion Convention Map
+
+All quaternion handoffs must be explicit:
+
+| System | Convention | Notes |
+|--------|-----------|-------|
+| HumanML3D / CLoSD internals | **wxyz** | `recover_root_rot_pos()` puts w at index 0; `qmul`/`qinv` in CLoSD assume wxyz |
+| Isaac Gym (CLoSD sim) | **xyzw** | Isaac Gym Preview uses xyzw |
+| ProtoMotions COMMON | **xyzw** | All algorithm-layer data; `RobotState` with `StateConversion.COMMON` |
+| ProtoMotions SIM (Isaac Lab) | **wxyz** | Isaac Lab/PhysX uses wxyz; `DataConversionMapping.sim_w_last=False` auto-converts |
+
+**Conversion points**:
+- `hml_conversion.py`: internal math uses wxyz (matching CLoSD). `recon_data` stores wxyz quaternions.
+- `robot_state_builder.py`: converts CLoSD wxyz → ProtoMotions xyzw before constructing `RobotState(state_conversion=COMMON)`.
+- ProtoMotions' `DataConversionMapping` handles xyzw↔wxyz for sim I/O automatically.
+
 ### Key Porting Challenges
 
 | Issue | Isaac Gym (CLoSD) | Isaac Lab (ProtoMotions) |
 |-------|-------------------|--------------------------|
-| Quaternion convention | xyzw | wxyz (sim), xyzw (common) |
+| Quaternion convention | wxyz (CLoSD internals), xyzw (Isaac Gym API) | wxyz (sim), xyzw (common) |
 | Joint ordering | Depth-first (MJCF) | Breadth-first (USD), remapped via `DataConversionMapping` |
 | Body names | Identical 24-body SMPL hierarchy | Same names, runtime reordering handled by ProtoMotions |
 | PD control | `gym.set_dof_position_target_tensor()` | `ImplicitActuatorCfg` or `robot.set_joint_position_target()` |
 | FPS | Diffusion 20fps, sim 30fps | Configurable via `sim.dt` + `decimation` |
+| Height offset | `offset_height = 0.92` (Y-up), `offset = 0.0` in CLoSD rep_util.py | Z-up; configurable in `coord_transform.py` |
 
 ## 3. Architecture
 
@@ -135,15 +152,20 @@ Ported from CLoSD's `rep_util.py` and `motion_process_torch.py`. Two core functi
   - 6D rotations: IK to get per-joint quats → continuous 6D
   - Local velocities: joint position diffs in root frame
   - Foot contacts: velocity threshold on ankle/toe joints
-- Save `recon_data = {r_rot, r_pos}` at last prefix frame
+- Save `recon_data = {r_rot, r_pos}` at frame `[-2]` (second-to-last input frame, which is the last frame with valid feature data since velocities consume one frame). `recon_data` quaternions are in **wxyz** convention.
 - Normalize with mean/std
 - Output: `[bs, T_20fps, 263]` + `recon_data`
 
-**`hml_to_pose(hml_norm, recon_data, prefix_len)`**:
+**`hml_to_pose(hml_norm, recon_data, sim_at_hml_idx)`**:
+- `sim_at_hml_idx`: the frame index within the generated HML sequence that corresponds to the sim's current state (typically `prefix_len - 1`). This is the alignment anchor.
 - Unnormalize
-- `recover_root_rot_pos()`: cumsum of angular deltas → absolute root rotation; cumsum of rotated XZ velocity deltas → absolute root position; absolute root height from dim 3
+- `recover_root_rot_pos()`: cumsum of angular deltas → absolute root rotation (wxyz); cumsum of rotated XZ velocity deltas → absolute root position; absolute root height from dim 3
 - `recover_from_ric()`: rotate egocentric joint positions by accumulated root rotation, add root XZ → global 22-joint positions
-- **Two-step alignment**: zero out HML's root at prefix boundary, then apply sim's `recon_data` root transform → stitches prediction to sim world position
+- **Two-step alignment** (the critical stitching step):
+  1. Extract HML's own root transform at `sim_at_hml_idx`: `hml_transform = {r_rot[sim_at_hml_idx], r_pos[sim_at_hml_idx]}`
+  2. Zero out: subtract HML root XZ position, rotate by inverse of HML root rotation → motion centered at origin facing forward
+  3. Apply sim's `recon_data`: rotate by sim root rotation, add sim root XZ position → motion placed at sim's actual world position
+  This ensures seamless stitching between prediction and current sim state.
 - 22→24 joints (add hands by extending wrist direction)
 - SMPL → Isaac coordinate transform + joint reorder
 - 20fps → 30fps bicubic upsampling
@@ -154,14 +176,14 @@ Ported from CLoSD's `rep_util.py` and `motion_process_torch.py`. Two core functi
 Two modes controlled by a flag:
 
 **`mode="diffusion"`**:
-- Extract 21-joint 6D rotations from HML dims 67-192
-- Convert 6D → rotation matrices (Gram-Schmidt-like orthogonalization)
-- Prepend root rotation from `recover_root_rot_pos()` → 22-joint global rotation matrices
-- Extend to 24 joints (hands = wrist rotation copied)
+- Extract 21-joint 6D rotations from HML dims 67-192. **These are LOCAL (parent-relative) rotations**, not global — they are produced by `Skeleton.inverse_kinematics_np()` during HumanML3D data preprocessing, which computes parent-relative joint rotations.
+- Convert 6D → local rotation matrices via Gram-Schmidt orthogonalization (the standard continuous 6D → SO(3) map)
+- Prepend root rotation from `recover_root_rot_pos()` (wxyz quat → rotation matrix) as joint 0
+- Extend to 24 joints (hands = identity rotation or wrist rotation copied)
 - Reorder SMPL → mujoco joint order
-- Use ProtoMotions' `compute_joint_rot_mats_from_global_mats()` → local rotation matrices
-- Use ProtoMotions' `extract_qpos_from_transforms()` → `dof_pos [bs, T, 69]`
-- **FK consistency check**: run `compute_forward_kinematics_from_transforms()` with derived local rotations, compare against position output. If mean error > 5cm, print warning.
+- These are already local/parent-relative rotations — feed directly to ProtoMotions' `extract_qpos_from_transforms(kinematic_info, root_pos, joint_rot_mats)` → `dof_pos [bs, T, 69]`
+- **Do NOT call `compute_joint_rot_mats_from_global_mats()`** — that function converts global→local, but our rotations are already local
+- **FK consistency check**: run `compute_forward_kinematics_from_transforms(kinematic_info, root_pos, joint_rot_mats)` with the local rotations, compare resulting positions against `recover_from_ric()` positions. If mean error > 5cm, print `WARNING: Diffusion rotations show high FK inconsistency ({error}cm). Consider --rotation-mode analytical`.
 
 **`mode="analytical"`**:
 - Compute bone direction vectors from parent→child positions
@@ -196,45 +218,68 @@ Velocity derivation:
 - `rigid_body_ang_vel`: from quaternion finite difference `2 * qmul(qinv(q[t]), q[t+1]) / dt`
 - `dof_vel`: `(dof_pos[t+1] - dof_pos[t-1]) / (2*dt)`
 
+Contact derivation:
+- `rigid_body_contacts`: `[num_bodies]` per frame. HML dims 259-262 provide 4 foot contact flags (L_Ankle, L_Toe, R_Ankle, R_Toe). Map these to the corresponding body indices. All other bodies get contact=0.
+
+**Performance note**: The IK in `pose_to_hml()` (via `Skeleton.inverse_kinematics_np()`) goes through NumPy/CPU. This is acceptable since it runs only once per planning horizon (~every 20 sim steps), not every frame.
+
 #### 3.5 `integration/closd_motion_lib.py` — MotionLib Interface
 
 ```
 class CLoSDMotionLib:
-    """Duck-types MotionLib for MimicControl.get_context()."""
+    """Duck-types MotionLib for MimicControl.get_context() and MimicMotionManager."""
 
     Properties (stubs for interface compatibility):
         num_motions() -> 1
-        motion_lengths -> [episode_length * dt]
-        motion_weights -> [1.0]
+        motion_lengths -> tensor([episode_length * dt])  # accessed by MimicMotionManager.get_done_tracks()
+        motion_weights -> tensor([1.0])
+        motion_file -> "closd_diffusion"  # for state_dict compatibility
 
     get_motion_state(motion_ids, motion_times) -> RobotState:
         # Delegates to robot_state_builder.get_state_at_time()
         # Returns interpolated state in COMMON format (xyzw quaternions)
+        # RobotState includes rigid_body_contacts: foot contacts from HML dims 259-262
+        #   mapped to body indices [L_Ankle, R_Ankle, L_Toe, R_Toe], all others zero.
+
+    get_motion_length(motion_ids) -> tensor:
+        # Returns motion_lengths[motion_ids] (called by MimicControl.get_context())
 ```
 
 #### 3.6 `integration/closd_motion_manager.py` — Closed-Loop Manager
 
 ```
 class CLoSDMotionManager(MimicMotionManager):
-    __init__(..., motion_provider, robot_state_builder, planning_horizon_30fps=20)
+    __init__(..., motion_provider, robot_state_builder, pred_len_20fps=40)
+
+    # planning_horizon_30fps is DERIVED, not a separate parameter:
+    #   planning_horizon_30fps = int(pred_len_20fps * 30 / 20)  # = 60 for pred_len=40
+    # This prevents silent inconsistency if pred_len changes.
 
     pose_buffer: [num_envs, context_len_30fps, 24, 3]  # sliding window of sim positions
-    recon_data: {r_rot, r_pos}  # root state from last diffusion call
+    recon_data: {r_rot, r_pos}  # root state from last diffusion call (wxyz quaternions)
+    frame_counter: int  # frames since last diffusion call
 
     post_physics_step():
-        super().post_physics_step()
+        super().post_physics_step()  # advances self.motion_times += env_dt
         # 1. Get current sim body positions from simulator
         # 2. Append to pose_buffer (sliding window)
-        # 3. Advance internal frame counter
-        # 4. If frame_counter % planning_horizon == 0:
+        # 3. Advance frame_counter
+        # 4. If frame_counter % planning_horizon_30fps == 0:
         #      Call motion_provider.generate_next_horizon(pose_buffer, recon_data, prompt)
         #      Update robot_state_builder cache with new horizon
         #      Update recon_data for next call
+        #      Reset motion_times to 0 for affected envs
+        #      Set motion_lib.motion_lengths to new horizon duration
+        #      (This prevents get_done_tracks() from signaling done mid-episode)
 
     sample_motions(env_ids):
         # On reset: clear pose_buffer, fill with current pose repeated
         # Reset recon_data to None (first diffusion call uses default)
+        # Reset motion_times[env_ids] = 0
+        # Set motion_lib.motion_lengths = [planning_horizon_30fps * env_dt]
 ```
+
+**`motion_times` management**: Each time the diffusion generates a new horizon, `motion_times` is reset to 0 and `motion_lengths` is set to the new horizon's duration. This way `MimicMotionManager.get_done_tracks()` only signals done when the current horizon is exhausted (triggering a new diffusion call), not when the episode time exceeds some arbitrary value. The episode terminates based on `episode_length` from the experiment config, not from `get_done_tracks()`.
 
 #### 3.7 `integration/experiment.py` — ProtoMotions Experiment Config
 
@@ -255,7 +300,12 @@ Ported from CLoSD `rep_util.py`:
 # Rotation matrices
 to_isaac_mat = Rx(-pi/2)          # SMPL Y-up → Isaac Z-up
 y180_rot = Ry(pi)                 # 180-degree Y rotation
-smpl2sim_rot_mat = Rx(-pi/2)^2    # Additional SMPL→sim rotation
+smpl2sim_rot_mat = Rx(-pi)        # = Rx(-pi/2) @ Rx(-pi/2), a 180-deg X rotation
+
+# Height offset (from CLoSD rep_util.py)
+# offset_height = 0.92 (SMPL standing height in Y-up)
+# offset = 0.0 (currently unused, FIXME in CLoSD)
+# In Isaac Lab (Z-up), this maps to a Z offset. Configurable in coord_transform.py.
 
 # Joint reordering (24 elements each)
 smpl_2_mujoco = [0,1,4,7,10,2,5,8,11,3,6,9,12,15,13,16,18,20,22,14,17,19,21,23]
@@ -499,4 +549,5 @@ numpy
 | ProtoMotions tracker trained on AMASS motions, not diffusion output | Distribution mismatch → jittery tracking | Diffusion output is close to AMASS distribution (same training data). If poor, increase guidance or reduce planning horizon |
 | FPS conversion artifacts (20↔30) | Jerky motion at boundaries | Bicubic interpolation (same as CLoSD), verified in tests |
 | Isaac Lab joint ordering differs from Isaac Gym | Actions/observations sent to wrong joints | ProtoMotions' `DataConversionMapping` handles this automatically |
-| Quaternion convention mismatch | Silent wrong orientations | All conversions explicitly documented; ProtoMotions auto-converts between wxyz (sim) and xyzw (common) |
+| Quaternion convention mismatch | Silent wrong orientations | All conversions explicitly documented with convention table; ProtoMotions auto-converts between wxyz (sim) and xyzw (common) |
+| Diffusion produces NaN or degenerate output | Tracker falls, episode ruined | Check for NaN after each diffusion call; if detected, repeat last valid horizon and log warning. If FK error > 10cm, also fall back to last valid horizon |
