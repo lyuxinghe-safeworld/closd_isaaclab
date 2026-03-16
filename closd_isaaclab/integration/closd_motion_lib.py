@@ -83,6 +83,10 @@ class CLoSDMotionLib:
         """Return the number of motions (always 1 for diffusion-based lib)."""
         return 1
 
+    def smooth_contacts(self, window_size: int) -> None:
+        """No-op: diffusion-generated contacts don't need smoothing."""
+        pass
+
     def get_motion_length(self, motion_ids) -> Tensor:
         """Return motion length(s) for the given motion_ids.
 
