@@ -166,7 +166,9 @@ export NCCL_NET=Socket
 export MASTER_ADDR=127.0.0.1
 export MASTER_PORT=29500
 
-python scripts/run_closd_isaaclab.py \
+# Must run from ProtoMotions dir (USD assets use relative paths)
+cd ~/code/ProtoMotions
+python ~/code/closd_isaaclab/scripts/run_closd_isaaclab.py \
     --prompt "a person walks forward" \
     --tracker-checkpoint ~/code/ProtoMotions/data/pretrained_models/motion_tracker/smpl/last.ckpt \
     --num-envs 1
