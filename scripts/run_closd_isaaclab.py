@@ -565,40 +565,31 @@ def generate_motion_file(motion_provider, prompt, output_dir, rotation_solver):
     except Exception as e:
         log.warning("  Failed to render skeleton video: %s", e)
 
-    # Get local rotations from HML (20fps) — SMPL order, SMPL Y-up frame
-    local_rot_mats, _, _ = rotation_solver.solve(None, hml_raw=hml_raw)
-    T_20 = local_rot_mats.shape[1]
-    local_rot_smpl = local_rot_mats[0]  # [T_20, 24, 3, 3] in SMPL order
+    T_20 = hml_raw.shape[1]
 
-    # Convert diffusion positions to Isaac Z-up coords
+    # Convert diffusion positions to Isaac Z-up coords (MJCF body order)
     ct = CoordTransform()
     pos_isaac_20 = ct.smpl_to_isaac(positions_smpl[0])[:T_20]  # [T_20, 24, 3]
     root_pos_isaac = pos_isaac_20[:, 0, :]  # [T_20, 3] — Z-up
 
     # ---------------------------------------------------------------
-    # Rotation pipeline: SMPL Y-up → Isaac Z-up (MJCF-compatible)
+    # Rotation pipeline: analytical IK from Isaac-space positions
     # ---------------------------------------------------------------
-    # Step 1: Compute SMPL global rotations (chain through SMPL tree)
-    global_rot_smpl = _smpl_globals_from_locals(local_rot_smpl)  # [T_20, 24, 3, 3]
+    # The diffusion model's 6D rotations (hml_raw[67:193]) are unreliable
+    # for arm joints — they produce T-pose arms while positions show correct
+    # arm-down poses. Instead, derive rotations from positions via analytical
+    # IK, which guarantees position-rotation consistency.
+    from closd_isaaclab.diffusion.robot_state_builder import analytical_ik
 
-    # Step 2: Apply coordinate frame rotation as similarity transform
-    #   G_isaac = R_frame @ G_smpl @ R_frame^T
-    # where R_frame transforms SMPL positions to Isaac positions
-    R_frame = ct.rot_mat.float()  # [3, 3]
-    R_frame_T = R_frame.T
-    global_rot_isaac = R_frame @ global_rot_smpl @ R_frame_T  # [T_20, 24, 3, 3]
+    ki = rotation_solver.kinematic_info
+    global_rot_mjcf = analytical_ik(pos_isaac_20, ki)  # [T_20, 24, 3, 3]
 
-    # Step 3: Reorder globals from SMPL order to MJCF order
-    smpl2mj = torch.tensor(smpl_2_mujoco, dtype=torch.long)
-    global_rot_mjcf = global_rot_isaac[:, smpl2mj]  # [T_20, 24, 3, 3]
-
-    # Step 4: Extract MJCF-compatible joint rotations
-    # (factors out MJCF reference rotations, which are identity for SMPL)
+    # Extract MJCF-compatible local joint rotations
     joint_rot_mjcf = compute_joint_rot_mats_from_global_mats(
         ki, global_rot_mjcf
     )  # [T_20, 24, 3, 3]
 
-    # Step 5: FK with Isaac root_pos and MJCF joint rotations
+    # FK with Isaac root_pos and MJCF joint rotations
     # Produces internally-consistent positions, rotations, velocities
     motion = fk_from_transforms_with_velocities(
         ki, root_pos_isaac, joint_rot_mjcf, fps=20, compute_velocities=True

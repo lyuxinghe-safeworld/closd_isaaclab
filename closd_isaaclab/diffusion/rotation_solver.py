@@ -5,8 +5,8 @@ The diffusion model outputs 263-dim HumanML3D features. Dimensions 67-192 contai
 data preprocessing.
 
 This module provides:
-- cont6d_to_matrix: 6D continuous rotation -> 3x3 rotation matrix (Gram-Schmidt)
-- matrix_to_cont6d: 3x3 rotation matrix -> 6D continuous rotation (first two rows)
+- cont6d_to_matrix: 6D continuous rotation -> 3x3 rotation matrix (CLoSD column convention)
+- matrix_to_cont6d: 3x3 rotation matrix -> 6D continuous rotation (first two columns)
 - wxyz_quat_to_matrix: wxyz quaternion -> 3x3 rotation matrix
 - RotationSolver: extracts per-joint local rotation matrices from hml_raw,
   optionally using kinematic_info from ProtoMotions to compute qpos and FK consistency.
@@ -32,38 +32,40 @@ from closd.diffusion_planner.data_loaders.humanml.scripts.motion_process_torch i
 def cont6d_to_matrix(cont6d: Tensor) -> Tensor:
     """Convert 6D continuous rotation representation to 3x3 rotation matrix.
 
-    Uses Gram-Schmidt orthogonalization.
+    Uses cross-product orthogonalization matching CLoSD's convention:
+    the 6D representation stores the first two COLUMNS of the rotation matrix.
 
     Parameters
     ----------
     cont6d : Tensor
-        [..., 6] 6D rotation representation.
+        [..., 6] 6D rotation representation (first two columns of R).
 
     Returns
     -------
     Tensor
-        [..., 3, 3] rotation matrix.
+        [..., 3, 3] rotation matrix (basis vectors as columns).
     """
-    a1 = cont6d[..., :3]  # [..., 3]
-    a2 = cont6d[..., 3:]  # [..., 3]
+    x_raw = cont6d[..., :3]  # [..., 3]  first column
+    y_raw = cont6d[..., 3:]  # [..., 3]  second column (raw)
 
-    # Gram-Schmidt
-    b1 = a1 / a1.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+    # Normalize first column
+    x = x_raw / x_raw.norm(dim=-1, keepdim=True).clamp(min=1e-8)
 
-    dot = (b1 * a2).sum(dim=-1, keepdim=True)  # [..., 1]
-    b2_unnorm = a2 - dot * b1
-    b2 = b2_unnorm / b2_unnorm.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+    # Third column: perpendicular to x and y_raw
+    z = torch.linalg.cross(x, y_raw)
+    z = z / z.norm(dim=-1, keepdim=True).clamp(min=1e-8)
 
-    b3 = torch.linalg.cross(b1, b2)  # [..., 3]
+    # Recompute second column: perpendicular to z and x (ensures orthogonality)
+    y = torch.linalg.cross(z, x)
 
-    # Stack along second-to-last dim: [..., 3, 3]
-    return torch.stack([b1, b2, b3], dim=-2)
+    # Stack as COLUMNS: [..., 3, 3]
+    return torch.stack([x, y, z], dim=-1)
 
 
 def matrix_to_cont6d(mat: Tensor) -> Tensor:
     """Convert 3x3 rotation matrix to 6D continuous rotation representation.
 
-    Takes the first two rows and flattens them.
+    Takes the first two columns and flattens them, matching CLoSD's convention.
 
     Parameters
     ----------
@@ -73,12 +75,11 @@ def matrix_to_cont6d(mat: Tensor) -> Tensor:
     Returns
     -------
     Tensor
-        [..., 6] 6D representation (first two rows of mat concatenated).
+        [..., 6] 6D representation (first two columns of mat concatenated).
     """
-    # mat[..., 0, :] is first row, mat[..., 1, :] is second row
-    row0 = mat[..., 0, :]  # [..., 3]
-    row1 = mat[..., 1, :]  # [..., 3]
-    return torch.cat([row0, row1], dim=-1)  # [..., 6]
+    col0 = mat[..., :, 0]  # [..., 3]  first column
+    col1 = mat[..., :, 1]  # [..., 3]  second column
+    return torch.cat([col0, col1], dim=-1)  # [..., 6]
 
 
 def wxyz_quat_to_matrix(quat: Tensor) -> Tensor:
@@ -281,26 +282,28 @@ class RotationSolver:
 
             # FK consistency check
             if positions is not None:
-                consistency_error, _ = self.verify_consistency(positions, dof_pos)
+                consistency_error, _ = self.verify_consistency(
+                    positions, qpos_flat.reshape(bs, T, -1),
+                )
 
         return local_rot_mats_24, dof_pos, consistency_error
 
     def verify_consistency(
         self,
         positions: Tensor,
-        dof_pos: Tensor,
+        full_qpos: Tensor,
     ) -> Tuple[float, Tensor]:
         """Verify FK consistency between joint positions and qpos.
 
-        Runs forward kinematics from dof_pos and compares resulting world positions
-        against the reference positions.
+        Runs forward kinematics from full_qpos and compares resulting world
+        positions against the reference positions.
 
         Parameters
         ----------
         positions : Tensor
             [bs, T, N_joints, 3] reference world joint positions.
-        dof_pos : Tensor
-            [bs, T, nq] MuJoCo qpos vector.
+        full_qpos : Tensor
+            [bs, T, nq] full MuJoCo qpos (root_pos + root_quat + joint_dofs).
 
         Returns
         -------
@@ -319,12 +322,12 @@ class RotationSolver:
             compute_forward_kinematics_from_transforms,
         )
 
-        bs, T = dof_pos.shape[:2]
-        dof_flat = dof_pos.reshape(bs * T, -1)
+        bs, T = full_qpos.shape[:2]
+        qpos_flat = full_qpos.reshape(bs * T, -1)
 
-        # Recover transforms from qpos
+        # Recover transforms from full qpos
         root_pos_fk, joint_rot_mats_fk = extract_transforms_from_qpos(
-            self.kinematic_info, dof_flat
+            self.kinematic_info, qpos_flat
         )  # root_pos_fk: [bs*T, 3], joint_rot_mats_fk: [bs*T, Nb, 3, 3]
 
         # Compute FK world positions

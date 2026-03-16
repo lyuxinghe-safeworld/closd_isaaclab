@@ -63,6 +63,123 @@ def _rotation_between_vectors(v1: Tensor, v2: Tensor) -> Tensor:
     return R
 
 
+def _estimate_root_rotation(
+    positions: Tensor,
+    l_hip_idx: int,
+    r_hip_idx: int,
+) -> Tensor:
+    """Estimate the root (pelvis) global rotation from hip positions.
+
+    Uses the L_Hip→R_Hip vector to determine the character's lateral axis,
+    then derives forward and up to form an orthonormal frame.  This avoids
+    the identity-root assumption that causes twist accumulation in the
+    spine chain when the character faces away from the MJCF rest direction.
+
+    Args:
+        positions: [T, num_bodies, 3] world-frame joint positions.
+        l_hip_idx: Body index of L_Hip in MJCF order.
+        r_hip_idx: Body index of R_Hip in MJCF order.
+
+    Returns:
+        [T, 3, 3] root rotation matrices (columns = [forward, lateral, up]).
+    """
+    T = positions.shape[0]
+    lateral = positions[:, l_hip_idx] - positions[:, r_hip_idx]  # [T, 3]
+    lateral[:, 2] = 0.0  # project onto horizontal plane
+    lateral = lateral / (lateral.norm(dim=-1, keepdim=True) + 1e-8)
+
+    up = torch.zeros(T, 3, device=positions.device, dtype=positions.dtype)
+    up[:, 2] = 1.0
+
+    forward = torch.linalg.cross(lateral, up)  # [T, 3]
+    forward = forward / (forward.norm(dim=-1, keepdim=True) + 1e-8)
+
+    # Recompute lateral for strict orthogonality
+    lateral = torch.linalg.cross(up, forward)
+
+    return torch.stack([forward, lateral, up], dim=-1)  # [T, 3, 3]
+
+
+def analytical_ik(
+    positions: Tensor,
+    ki,
+    num_bodies: int = 24,
+) -> Tensor:
+    """Compute global rotation matrices from positions via analytical IK.
+
+    Walks the MJCF kinematic tree from root to leaves, computing per-body
+    rotations from bone direction vectors.  Uses hip-based root rotation
+    estimation to avoid twist accumulation in the spine chain.
+
+    Parameters
+    ----------
+    positions : Tensor
+        [T, num_bodies, 3] world-frame joint positions in MJCF body order.
+    ki : KinematicInfo
+        ProtoMotions kinematic info (parent indices, rest-pose bone offsets, etc.).
+    num_bodies : int
+        Number of rigid bodies (default 24).
+
+    Returns
+    -------
+    Tensor
+        [T, num_bodies, 3, 3] global rotation matrices in MJCF body order.
+    """
+    T = positions.shape[0]
+    nb = num_bodies
+    n_input = positions.shape[1]
+    dev = positions.device
+
+    # Guard: positions must have at least num_bodies joints
+    if n_input < nb:
+        raise ValueError(
+            f"analytical_ik expects {nb}-body positions (MJCF order), "
+            f"got {n_input} joints. Convert to Isaac space first via CoordTransform."
+        )
+
+    global_rots = torch.eye(3, device=dev).unsqueeze(0).expand(T, nb, 3, 3).clone()
+
+    # Estimate root rotation from hip positions
+    l_hip_idx = ki.body_names.index("L_Hip")
+    r_hip_idx = ki.body_names.index("R_Hip")
+    global_rots[:, 0] = _estimate_root_rotation(positions, l_hip_idx, r_hip_idx)
+
+    for i in range(nb):
+        pi = ki.parent_indices[i]
+        if pi < 0:
+            continue  # root rotation already set above
+
+        parent_rot = global_rots[:, pi]  # [T, 3, 3]
+
+        # Actual bone in parent's local frame
+        actual_bone_world = positions[:, i] - positions[:, pi]  # [T, 3]
+        actual_bone_local = torch.bmm(
+            parent_rot.transpose(-1, -2), actual_bone_world.unsqueeze(-1)
+        ).squeeze(-1)
+
+        # Rest bone in parent's local frame (from MJCF)
+        rest_bone_local = ki.local_pos[i].to(dev)  # [3]
+
+        if rest_bone_local.norm() > 1e-6:
+            local_rot = _rotation_between_vectors(
+                rest_bone_local.unsqueeze(0).expand(T, -1),
+                actual_bone_local,
+            )  # [T, 3, 3]
+        else:
+            local_rot = torch.eye(3, device=dev).unsqueeze(0).expand(T, 3, 3)
+
+        # Include reference rotation from MJCF
+        ref_rot = ki.local_rot_ref_mat[i].to(dev)  # [3, 3]
+
+        # Global rotation: parent_rot @ ref_rot @ local_rot
+        global_rots[:, i] = torch.bmm(
+            torch.bmm(parent_rot, ref_rot.unsqueeze(0).expand(T, 3, 3)),
+            local_rot,
+        )
+
+    return global_rots
+
+
 class RobotStateBuilder:
     """Build and cache RobotState-compatible motion data from diffusion output.
 
@@ -122,20 +239,16 @@ class RobotStateBuilder:
         # 2. Compute body velocities via finite differences
         self._velocities = self._compute_velocities(positions)  # [bs, T, num_bodies, 3]
 
-        # 3. Derive rotations and dof_pos from positions using analytical IK
-        #    The diffusion model produces reliable positions but unreliable rotations.
-        #    We compute rotations from bone direction vectors (analytical IK), then
-        #    use ProtoMotions' FK pipeline for consistency. The positions we store
-        #    are the ORIGINAL diffusion positions (not FK-derived), so the red ball
-        #    markers match the diffusion skeleton video.
+        # 3. Derive rotations and dof_pos from positions using analytical IK.
+        #    The diffusion model produces reliable positions but unreliable
+        #    6D rotations for arms. We compute rotations from bone direction
+        #    vectors (analytical IK) for position-rotation consistency.
         self._dof_pos = None
         self._dof_vel = None
         self._rotations = None      # [bs, T, num_bodies, 4] xyzw quaternions
         self._ang_velocities = None  # [bs, T, num_bodies, 3]
         if self.rotation_solver is not None and self.rotation_solver.kinematic_info is not None and hml_raw is not None:
-            from closd_isaaclab.utils.fps_convert import fps_convert
             from protomotions.components.pose_lib import (
-                compute_forward_kinematics_from_transforms,
                 compute_joint_rot_mats_from_global_mats,
                 extract_qpos_from_transforms,
                 compute_angular_velocity,
@@ -147,13 +260,6 @@ class RobotStateBuilder:
             bs = positions.shape[0]
             nb = self.num_bodies
 
-            # Get rest-pose bone directions (identity rotations)
-            identity_rots = torch.eye(3, device=positions.device).unsqueeze(0).expand(nb, 3, 3).unsqueeze(0)
-            rest_pos, _ = compute_forward_kinematics_from_transforms(
-                ki, torch.zeros(1, 3, device=positions.device), identity_rots
-            )
-            rest_pos = rest_pos[0]  # [nb, 3]
-
             all_rot_30 = []
             all_dof_pos_30 = []
             all_dof_vel_30 = []
@@ -162,45 +268,10 @@ class RobotStateBuilder:
             for b in range(bs):
                 pos_b = positions[b]  # [T_30, nb, 3]
 
-                # Chain-based analytical IK: walk kinematic tree from root to leaves.
-                # For each body: compute local rotation from parent-relative bone direction.
-                # This produces dof_pos in the same range as GT (~0.1 abs mean) and
-                # FK errors of ~0.04m, vs the old bone-direction approach (0.4 abs mean, 0.20m FK).
-                global_rots = torch.eye(3, device=positions.device).unsqueeze(0).expand(T_30, nb, 3, 3).clone()
-
-                for i in range(nb):
-                    pi = ki.parent_indices[i]
-                    if pi < 0:
-                        continue  # root stays identity
-
-                    parent_rot = global_rots[:, pi]  # [T_30, 3, 3]
-
-                    # Actual bone in parent's local frame
-                    actual_bone_world = pos_b[:, i] - pos_b[:, pi]  # [T_30, 3]
-                    actual_bone_local = torch.bmm(parent_rot.transpose(-1, -2), actual_bone_world.unsqueeze(-1)).squeeze(-1)
-
-                    # Rest bone in parent's local frame (from MJCF)
-                    rest_bone_local = ki.local_pos[i].to(positions.device)  # [3]
-
-                    if rest_bone_local.norm() > 1e-6:
-                        local_rot = _rotation_between_vectors(
-                            rest_bone_local.unsqueeze(0).expand(T_30, -1),
-                            actual_bone_local,
-                        )  # [T_30, 3, 3]
-                    else:
-                        local_rot = torch.eye(3, device=positions.device).unsqueeze(0).expand(T_30, 3, 3)
-
-                    # Include reference rotation from MJCF
-                    ref_rot = ki.local_rot_ref_mat[i].to(positions.device)  # [3, 3]
-
-                    # Global rotation: parent_rot @ ref_rot @ local_rot
-                    global_rots[:, i] = torch.bmm(
-                        torch.bmm(parent_rot, ref_rot.unsqueeze(0).expand(T_30, 3, 3)),
-                        local_rot,
-                    )
+                global_rots = analytical_ik(pos_b, ki, nb)  # [T_30, nb, 3, 3]
 
                 # Convert global rotations to local rotations
-                local_rots = compute_joint_rot_mats_from_global_mats(ki, global_rots)  # [T_30, nb, 3, 3]
+                local_rots = compute_joint_rot_mats_from_global_mats(ki, global_rots)
 
                 # Global rotations → xyzw quaternions
                 rot_flat = global_rots.reshape(-1, 3, 3)
@@ -220,8 +291,8 @@ class RobotStateBuilder:
                 dof_vel = compute_angular_velocity(local_rots.unsqueeze(0), fps=30)
                 dof_vel = dof_vel[0, :, 1:, :].reshape(T_30, -1)  # [T_30, 69]
 
-                # Angular velocities (zeros — analytical IK doesn't produce smooth enough
-                # rotations for meaningful angular velocity)
+                # Angular velocities (zeros — analytical IK doesn't produce smooth
+                # enough rotations for meaningful angular velocity)
                 ang_vel = torch.zeros(T_30, nb, 3, device=positions.device)
 
                 all_rot_30.append(global_quat)
@@ -233,7 +304,6 @@ class RobotStateBuilder:
             self._dof_pos = torch.stack(all_dof_pos_30).to(positions.device)
             self._dof_vel = torch.stack(all_dof_vel_30).to(positions.device)
             self._ang_velocities = torch.stack(all_ang_vel_30).to(positions.device)
-            # Keep original diffusion positions (not FK-derived)
 
         # 4. Extract foot contacts from hml_raw
         self._contacts = None
@@ -293,40 +363,16 @@ class RobotStateBuilder:
     # ------------------------------------------------------------------
 
     def _compute_velocities(self, positions: Tensor) -> Tensor:
-        """Compute per-body velocities via finite differencing.
-
-        Uses central differencing for interior frames:
-            vel[t] = (pos[t+1] - pos[t-1]) / (2 * dt)
-
-        Uses forward difference at t=0:
-            vel[0] = (pos[1] - pos[0]) / dt
-
-        Uses backward difference at t=T-1:
-            vel[-1] = (pos[-1] - pos[-2]) / dt
-
-        Parameters
-        ----------
-        positions : Tensor
-            [bs, T, num_bodies, 3]
-
-        Returns
-        -------
-        Tensor
-            [bs, T, num_bodies, 3] velocities.
-        """
+        """Compute per-body velocities via finite differencing."""
         bs, T, nb, d = positions.shape
         vel = torch.zeros_like(positions)
 
         if T == 1:
-            return vel  # single frame -> zero velocity
+            return vel
 
-        # Forward difference at t=0
         vel[:, 0, :, :] = (positions[:, 1, :, :] - positions[:, 0, :, :]) / self.dt
-
-        # Backward difference at t=T-1
         vel[:, -1, :, :] = (positions[:, -1, :, :] - positions[:, -2, :, :]) / self.dt
 
-        # Central differencing for interior frames
         if T > 2:
             vel[:, 1:-1, :, :] = (
                 positions[:, 2:, :, :] - positions[:, :-2, :, :]
@@ -335,20 +381,7 @@ class RobotStateBuilder:
         return vel
 
     def _compute_velocities_1d(self, data: Tensor) -> Tensor:
-        """Compute velocities for 1D data (e.g. dof_pos) via finite differencing.
-
-        Same boundary treatment as _compute_velocities.
-
-        Parameters
-        ----------
-        data : Tensor
-            [bs, T, D] — e.g. dof_pos
-
-        Returns
-        -------
-        Tensor
-            [bs, T, D] velocities.
-        """
+        """Compute velocities for 1D data (e.g. dof_pos) via finite differencing."""
         bs, T, D = data.shape
         vel = torch.zeros_like(data)
 
@@ -364,34 +397,12 @@ class RobotStateBuilder:
         return vel
 
     def _extract_contacts(self, hml_raw: Tensor) -> Tensor:
-        """Map HML foot contacts (dims 259-262) to a [bs, T, num_bodies] contact tensor.
-
-        HML dims 259-262 are binary foot contact flags for:
-            dim 259 -> L_Ankle -> MuJoCo body 3
-            dim 260 -> L_Toe   -> MuJoCo body 4
-            dim 261 -> R_Ankle -> MuJoCo body 7
-            dim 262 -> R_Toe   -> MuJoCo body 8
-
-        Parameters
-        ----------
-        hml_raw : Tensor
-            [bs, T_20fps, 263] raw HumanML3D features.
-
-        Returns
-        -------
-        Tensor
-            [bs, T, num_bodies] float contact tensor, where T matches the
-            time dimension of the cached positions.  If T != T_20fps, the
-            contact signal is resampled (nearest-neighbour).
-        """
+        """Map HML foot contacts (dims 259-262) to a [bs, T, num_bodies] contact tensor."""
         bs, T_20fps, _ = hml_raw.shape
-        # Extract the 4 foot contact flags: [bs, T_20fps, 4]
-        foot_contacts = hml_raw[..., 259:263]  # [bs, T_20fps, 4]
+        foot_contacts = hml_raw[..., 259:263]
 
-        # Target T from cached positions
         T_target = self._positions.shape[1] if self._positions is not None else T_20fps
 
-        # Build full contact tensor [bs, T_20fps, num_bodies]
         contacts_full = torch.zeros(
             bs, T_20fps, self.num_bodies,
             dtype=hml_raw.dtype,
@@ -400,16 +411,13 @@ class RobotStateBuilder:
         for hml_idx, body_idx in enumerate(_HML_TO_MUJOCO_CONTACT):
             contacts_full[:, :, body_idx] = foot_contacts[:, :, hml_idx]
 
-        # Resample to T_target if needed (nearest neighbour along time axis)
         if T_20fps != T_target:
-            # contacts_full: [bs, T_20fps, num_bodies]
-            # We need to resample the time dimension
-            contacts_full = contacts_full.permute(0, 2, 1)  # [bs, num_bodies, T_20fps]
+            contacts_full = contacts_full.permute(0, 2, 1)
             contacts_full = torch.nn.functional.interpolate(
                 contacts_full.float(),
                 size=T_target,
                 mode="nearest",
-            )  # [bs, num_bodies, T_target]
-            contacts_full = contacts_full.permute(0, 2, 1)  # [bs, T_target, num_bodies]
+            )
+            contacts_full = contacts_full.permute(0, 2, 1)
 
         return contacts_full

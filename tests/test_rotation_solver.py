@@ -117,18 +117,18 @@ class TestMatrixToCont6d:
         out = matrix_to_cont6d(R)
         assert out.shape == (2, 5, 21, 6), f"Expected (2, 5, 21, 6), got {out.shape}"
 
-    def test_first_three_match_first_row(self):
-        """matrix_to_cont6d should return the first two rows of R."""
+    def test_first_three_match_first_column(self):
+        """matrix_to_cont6d should return the first two columns of R."""
         R = _random_rotation_matrices((4,))
         c6d = matrix_to_cont6d(R)
-        assert torch.allclose(c6d[..., :3], R[..., 0, :], atol=1e-6), \
-            "First 3 elements should match first row of R"
+        assert torch.allclose(c6d[..., :3], R[..., :, 0], atol=1e-6), \
+            "First 3 elements should match first column of R"
 
-    def test_last_three_match_second_row(self):
+    def test_last_three_match_second_column(self):
         R = _random_rotation_matrices((4,))
         c6d = matrix_to_cont6d(R)
-        assert torch.allclose(c6d[..., 3:], R[..., 1, :], atol=1e-6), \
-            "Last 3 elements should match second row of R"
+        assert torch.allclose(c6d[..., 3:], R[..., :, 1], atol=1e-6), \
+            "Last 3 elements should match second column of R"
 
 
 # ---------------------------------------------------------------------------
