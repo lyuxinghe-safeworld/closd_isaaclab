@@ -56,6 +56,17 @@ def _ry(angle: float) -> torch.Tensor:
     ], dtype=torch.float64)
 
 
+def _rz(angle: float) -> torch.Tensor:
+    """3x3 rotation matrix around the Z axis."""
+    c = math.cos(angle)
+    s = math.sin(angle)
+    return torch.tensor([
+        [ c,   -s,  0.0],
+        [ s,    c,  0.0],
+        [0.0,  0.0, 1.0],
+    ], dtype=torch.float64)
+
+
 class CoordTransform:
     """Bidirectional coordinate transform between SMPL space and Isaac Lab space.
 
@@ -79,8 +90,10 @@ class CoordTransform:
         # Full SMPL -> Isaac combined rotation
         # CLoSD applies: pos @ smpl2sim.T, then pos @ y180.T, then pos @ to_isaac.T
         # Combined: pos @ (to_isaac @ y180 @ smpl2sim).T
-        # So rot_mat is what we LEFT-multiply with pos (i.e. pos @ rot_mat)
-        self.rot_mat: torch.Tensor = (to_isaac_mat @ y180_rot @ smpl2sim_rot_mat).T
+        # Plus Rz(-pi/2) to align SMPL X-axis (left-right) with MJCF Y-axis
+        # Applied as: pos @ Rz(-90).T @ existing_chain.T = pos @ (existing_chain @ Rz(-90)).T
+        z_align = _rz(math.pi / 2)
+        self.rot_mat: torch.Tensor = (to_isaac_mat @ y180_rot @ smpl2sim_rot_mat @ z_align).T
         self.rot_mat_inv: torch.Tensor = self.rot_mat.T  # orthogonal -> inverse == transpose
 
         # Pre-compute index tensors
