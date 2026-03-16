@@ -180,7 +180,7 @@ class RobotStateBuilder:
                     actual_bone_local = torch.bmm(parent_rot.transpose(-1, -2), actual_bone_world.unsqueeze(-1)).squeeze(-1)
 
                     # Rest bone in parent's local frame (from MJCF)
-                    rest_bone_local = ki.local_pos[i]  # [3]
+                    rest_bone_local = ki.local_pos[i].to(positions.device)  # [3]
 
                     if rest_bone_local.norm() > 1e-6:
                         local_rot = _rotation_between_vectors(
@@ -191,7 +191,7 @@ class RobotStateBuilder:
                         local_rot = torch.eye(3, device=positions.device).unsqueeze(0).expand(T_30, 3, 3)
 
                     # Include reference rotation from MJCF
-                    ref_rot = ki.local_rot_ref_mat[i]  # [3, 3]
+                    ref_rot = ki.local_rot_ref_mat[i].to(positions.device)  # [3, 3]
 
                     # Global rotation: parent_rot @ ref_rot @ local_rot
                     global_rots[:, i] = torch.bmm(
