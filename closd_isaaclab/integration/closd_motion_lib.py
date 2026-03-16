@@ -201,6 +201,9 @@ class CLoSDMotionLib:
     def _make_zero_state(self, n: int, num_bodies: int) -> RobotState:
         """Create a zero-filled RobotState for the not-yet-built case.
 
+        All fields must be populated because MimicControl.get_context()
+        accesses rigid_body_rot, dof_pos, dof_vel, etc.
+
         Parameters
         ----------
         n : int
@@ -214,9 +217,19 @@ class CLoSDMotionLib:
             Zero-filled state with state_conversion=COMMON.
         """
         dev = self.device
+        num_dofs = (num_bodies - 1) * 3  # 23 joints x 3 DOF = 69 for SMPL
+
+        # Identity quaternion in xyzw (COMMON convention): [0, 0, 0, 1]
+        rot = torch.zeros(n, num_bodies, 4, device=dev)
+        rot[..., 3] = 1.0  # w=1 for identity in xyzw
+
         return RobotState(
             state_conversion=StateConversion.COMMON,
             rigid_body_pos=torch.zeros(n, num_bodies, 3, device=dev),
+            rigid_body_rot=rot,
             rigid_body_vel=torch.zeros(n, num_bodies, 3, device=dev),
+            rigid_body_ang_vel=torch.zeros(n, num_bodies, 3, device=dev),
+            dof_pos=torch.zeros(n, num_dofs, device=dev),
+            dof_vel=torch.zeros(n, num_dofs, device=dev),
             rigid_body_contacts=torch.zeros(n, num_bodies, device=dev),
         )
