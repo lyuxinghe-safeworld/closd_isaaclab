@@ -139,7 +139,14 @@ All checks should print `PASS`.
 Loads the pretrained SMPL tracker and runs it on an offline `.motion` file inside Isaac Lab.
 
 ```bash
+# Required env vars for GCP VMs
 export DISPLAY=:1
+export LD_LIBRARY_PATH="$HOME/code/env_isaaclab/lib/python3.11/site-packages/isaacsim/kit/extscore/omni.client.lib/bin:${LD_LIBRARY_PATH:-}"
+export NCCL_IB_DISABLE=1
+export NCCL_NET=Socket
+export MASTER_ADDR=127.0.0.1
+export MASTER_PORT=29500
+
 python scripts/verify_tracking.py \
     --checkpoint ~/code/ProtoMotions/data/pretrained_models/motion_tracker/smpl/last.ckpt \
     --motion-file ~/code/ProtoMotions/examples/data/smpl_humanoid_sit_armchair.motion \
@@ -151,10 +158,17 @@ python scripts/verify_tracking.py \
 Runs the complete text → diffusion → joint rotations → Isaac Lab tracker pipeline.
 
 ```bash
+# Required env vars for GCP VMs (same as Step 3)
 export DISPLAY=:1
+export LD_LIBRARY_PATH="$HOME/code/env_isaaclab/lib/python3.11/site-packages/isaacsim/kit/extscore/omni.client.lib/bin:${LD_LIBRARY_PATH:-}"
+export NCCL_IB_DISABLE=1
+export NCCL_NET=Socket
+export MASTER_ADDR=127.0.0.1
+export MASTER_PORT=29500
+
 python scripts/run_closd_isaaclab.py \
     --prompt "a person walks forward" \
-    --checkpoint ~/code/ProtoMotions/data/pretrained_models/motion_tracker/smpl/last.ckpt \
+    --tracker-checkpoint ~/code/ProtoMotions/data/pretrained_models/motion_tracker/smpl/last.ckpt \
     --num-envs 1
 ```
 
