@@ -63,6 +63,59 @@ def _rotation_between_vectors(v1: Tensor, v2: Tensor) -> Tensor:
     return R
 
 
+def retarget_bone_lengths(positions: Tensor, ki, num_bodies: int = 24) -> Tensor:
+    """Retarget positions to match MJCF skeleton bone lengths.
+
+    Preserves the bone *direction* from the input positions but replaces
+    the bone *length* with the MJCF skeleton's length.  Walks the kinematic
+    tree from root to leaves, placing each child at:
+
+        retargeted[child] = retargeted[parent] + direction * mjcf_length
+
+    The root position is kept unchanged.
+
+    Parameters
+    ----------
+    positions : Tensor
+        [T, num_bodies, 3] (or [bs, T, num_bodies, 3]) joint positions.
+    ki : KinematicInfo
+        ProtoMotions kinematic info with ``parent_indices`` and ``local_pos``.
+    num_bodies : int
+        Number of rigid bodies (default 24).
+
+    Returns
+    -------
+    Tensor
+        Same shape as *positions*, with MJCF-consistent bone lengths.
+    """
+    squeeze_bs = False
+    if positions.dim() == 3:
+        positions = positions.unsqueeze(0)
+        squeeze_bs = True
+
+    bs, T, nb, _ = positions.shape
+    dev = positions.device
+    retargeted = positions.clone()
+
+    for i in range(nb):
+        pi = ki.parent_indices[i]
+        if pi < 0:
+            continue  # root — keep as-is
+
+        mjcf_bone = ki.local_pos[i].to(dev)          # [3]
+        mjcf_len = mjcf_bone.norm().item()
+
+        bone_vec = positions[:, :, i] - positions[:, :, pi]   # [bs, T, 3]
+        bone_len = bone_vec.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+        bone_dir = bone_vec / bone_len
+
+        retargeted[:, :, i] = retargeted[:, :, pi] + bone_dir * mjcf_len
+
+    if squeeze_bs:
+        retargeted = retargeted.squeeze(0)
+    return retargeted
+
+
 def _procrustes_rotation(source: Tensor, target: Tensor) -> Tensor:
     """Solve for rotation R minimizing ||R @ source - target||² via SVD.
 
@@ -253,10 +306,12 @@ class RobotStateBuilder:
         dt: float = 1.0 / 30.0,
         rotation_solver=None,
         num_bodies: int = 24,
+        retarget: bool = False,
     ) -> None:
         self.dt = dt
         self.rotation_solver = rotation_solver
         self.num_bodies = num_bodies
+        self.retarget = retarget
 
         # Cached fields (set by build())
         self._positions: Optional[Tensor] = None
@@ -288,7 +343,11 @@ class RobotStateBuilder:
             [bs, T, 4] root rotation quaternions (wxyz). Passed to rotation_solver
             if provided.
         """
-        # 1. Store positions
+        # 1. Optionally retarget bone lengths to match MJCF skeleton
+        if self.retarget:
+            ki = self.rotation_solver.kinematic_info if self.rotation_solver is not None else None
+            if ki is not None:
+                positions = retarget_bone_lengths(positions, ki, self.num_bodies)
         self._positions = positions  # [bs, T, num_bodies, 3]
 
         # 2. Compute body velocities via finite differences

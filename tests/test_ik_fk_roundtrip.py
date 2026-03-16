@@ -352,3 +352,144 @@ class TestIKFKWithActualDiffusion:
             ratio = diff_mean / mjcf_len if mjcf_len > 0.1 else float('nan')
             print(f"{ki.body_names[i]:<15} {mjcf_len:>14.1f} {diff_mean:>15.1f} "
                   f"{diff_std:>14.1f} {ratio:>8.3f}")
+
+
+# ---------------------------------------------------------------------------
+# Test 4: Retarget + IK/FK roundtrip (should be perfect)
+# ---------------------------------------------------------------------------
+
+class TestRetargetIKFK:
+    """After retargeting bone lengths to MJCF, IK→FK should be exact."""
+
+    def test_retarget_preserves_directions(self):
+        """Retargeted bones should point in the same direction as originals."""
+        ki = _load_ki()
+        from closd_isaaclab.diffusion.robot_state_builder import retarget_bone_lengths
+
+        T = 10
+        joint_rot = torch.eye(3).unsqueeze(0).unsqueeze(0).expand(T, 24, 3, 3).clone()
+        root_pos = torch.zeros(T, 3)
+        root_pos[:, 2] = 0.95
+        fk_pos = _fk_positions(ki, root_pos, joint_rot)
+
+        # Scale bones unevenly to simulate diffusion
+        scaled_pos = fk_pos.clone()
+        scales = {2: 1.1, 3: 1.05, 6: 0.95, 7: 1.08, 9: 1.5, 13: 1.3}
+        for i in range(24):
+            pi = ki.parent_indices[i]
+            if pi < 0:
+                continue
+            s = scales.get(i, 1.0)
+            bone = fk_pos[:, i] - fk_pos[:, pi]
+            scaled_pos[:, i] = scaled_pos[:, pi] + bone * s
+
+        retargeted = retarget_bone_lengths(scaled_pos, ki)
+
+        for i in range(24):
+            pi = ki.parent_indices[i]
+            if pi < 0:
+                continue
+            orig_dir = scaled_pos[:, i] - scaled_pos[:, pi]
+            orig_dir = orig_dir / orig_dir.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+            ret_dir = retargeted[:, i] - retargeted[:, pi]
+            ret_dir = ret_dir / ret_dir.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+            cos_sim = (orig_dir * ret_dir).sum(dim=-1).mean()
+            assert cos_sim > 0.9999, (
+                f"{ki.body_names[i]}: direction changed, cos_sim={cos_sim:.6f}"
+            )
+
+    def test_retarget_gives_mjcf_bone_lengths(self):
+        """Retargeted positions should have exact MJCF bone lengths."""
+        ki = _load_ki()
+        from closd_isaaclab.diffusion.robot_state_builder import retarget_bone_lengths
+
+        T = 10
+        joint_rot = torch.eye(3).unsqueeze(0).unsqueeze(0).expand(T, 24, 3, 3).clone()
+        root_pos = torch.zeros(T, 3)
+        root_pos[:, 2] = 0.95
+        fk_pos = _fk_positions(ki, root_pos, joint_rot)
+
+        # Scale all bones by 1.15 (simulating HumanML3D skeleton)
+        scaled_pos = fk_pos.clone()
+        for i in range(24):
+            pi = ki.parent_indices[i]
+            if pi < 0:
+                continue
+            bone = fk_pos[:, i] - fk_pos[:, pi]
+            scaled_pos[:, i] = scaled_pos[:, pi] + bone * 1.15
+
+        retargeted = retarget_bone_lengths(scaled_pos, ki)
+
+        for i in range(24):
+            pi = ki.parent_indices[i]
+            if pi < 0:
+                continue
+            ret_bone_len = (retargeted[:, i] - retargeted[:, pi]).norm(dim=-1).mean().item()
+            mjcf_len = ki.local_pos[i].norm().item()
+            assert abs(ret_bone_len - mjcf_len) < 1e-5, (
+                f"{ki.body_names[i]}: bone len {ret_bone_len*1000:.2f} mm != MJCF {mjcf_len*1000:.2f} mm"
+            )
+
+    def test_retarget_then_ik_fk_is_exact(self):
+        """Retarget → IK → FK should give 0 error (bones match MJCF)."""
+        ki = _load_ki()
+        from closd_isaaclab.diffusion.robot_state_builder import retarget_bone_lengths
+
+        # Create positions with mismatched bone lengths
+        T = 10
+        joint_rot = torch.eye(3).unsqueeze(0).unsqueeze(0).expand(T, 24, 3, 3).clone()
+        root_pos = torch.zeros(T, 3)
+        root_pos[:, 2] = 0.95
+        fk_pos = _fk_positions(ki, root_pos, joint_rot)
+
+        # Heavily scale bones (mimicking worst-case HumanML3D mismatch)
+        scaled_pos = fk_pos.clone()
+        for i in range(24):
+            pi = ki.parent_indices[i]
+            if pi < 0:
+                continue
+            bone = fk_pos[:, i] - fk_pos[:, pi]
+            scale = 1.0 + 0.3 * ((i * 7) % 11) / 10.0  # 1.0 to 1.3
+            scaled_pos[:, i] = scaled_pos[:, pi] + bone * scale
+
+        # Retarget
+        retargeted = retarget_bone_lengths(scaled_pos, ki)
+
+        # IK → FK
+        fk_pos_rt, _ = _ik_then_fk(ki, retargeted)
+
+        print("\n--- Retarget (up to 30% bone mismatch) → IK → FK ---")
+        per_joint = _print_per_joint_error(ki, retargeted, fk_pos_rt)
+
+        mean_err = per_joint.mean().item()
+        assert mean_err < 0.001, f"Retarget→IK→FK error: {mean_err*1000:.2f} mm (should be ~0)"
+
+    def test_retarget_then_ik_fk_with_gt_motion(self):
+        """GT motion (already MJCF bones) → retarget is no-op → IK/FK exact."""
+        ki = _load_ki()
+        from closd_isaaclab.diffusion.robot_state_builder import retarget_bone_lengths
+
+        gt_path = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(
+                __import__("protomotions").__file__))),
+            "examples/data/smpl_humanoid_sit_armchair.motion",
+        )
+        if not os.path.exists(gt_path):
+            pytest.skip("GT motion not found")
+
+        gt = torch.load(gt_path, map_location="cpu", weights_only=False)
+        positions = gt["rigid_body_pos"][:50]
+
+        retargeted = retarget_bone_lengths(positions, ki)
+
+        # Should be a no-op (GT already has MJCF bone lengths)
+        retarget_diff = (retargeted - positions).norm(dim=-1).mean().item()
+        print(f"\nGT retarget diff: {retarget_diff*1000:.4f} mm (should be ~0)")
+        assert retarget_diff < 1e-5, f"Retarget changed GT positions: {retarget_diff*1000:.4f} mm"
+
+        # IK → FK should be exact
+        fk_pos_rt, _ = _ik_then_fk(ki, retargeted)
+        per_joint = (fk_pos_rt - retargeted).norm(dim=-1).mean(dim=0)
+        mean_err = per_joint.mean().item()
+        print(f"GT retarget→IK→FK error: {mean_err*1000:.4f} mm")
+        assert mean_err < 0.001, f"Error: {mean_err*1000:.2f} mm"

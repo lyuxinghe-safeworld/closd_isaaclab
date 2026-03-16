@@ -166,6 +166,21 @@ def create_parser() -> argparse.ArgumentParser:
         default=False,
         help="Run diffusion standalone (skip ProtoMotions tracker).",
     )
+    parser.add_argument(
+        "--retarget-bone-lengths",
+        action="store_true",
+        default=False,
+        help="Retarget diffused positions to MJCF skeleton bone lengths "
+             "before IK. Preserves bone directions but snaps lengths to "
+             "the MJCF file, making the IK/FK roundtrip exact.",
+    )
+    parser.add_argument(
+        "--motion-file",
+        type=str,
+        default=None,
+        help="Path to a pre-generated .motion file. If provided, skips "
+             "diffusion generation and runs the tracker directly.",
+    )
 
     return parser
 
@@ -246,7 +261,7 @@ def init_rotation_solver(args):
     return solver
 
 
-def init_robot_state_builder(rotation_solver):
+def init_robot_state_builder(rotation_solver, retarget=False):
     """Initialize the RobotStateBuilder."""
     from closd_isaaclab.diffusion.robot_state_builder import RobotStateBuilder
 
@@ -255,6 +270,7 @@ def init_robot_state_builder(rotation_solver):
         dt=1.0 / 30.0,
         rotation_solver=rotation_solver,
         num_bodies=24,
+        retarget=retarget,
     )
     return builder
 
@@ -522,7 +538,8 @@ def _smpl_globals_from_locals(local_rot_mats: torch.Tensor) -> torch.Tensor:
     return global_rot
 
 
-def generate_motion_file(motion_provider, prompt, output_dir, rotation_solver):
+def generate_motion_file(motion_provider, prompt, output_dir, rotation_solver,
+                         retarget=False):
     """Generate diffusion motion and save as ProtoMotions .motion file.
 
     Follows the same rotation conversion pipeline as ProtoMotions'
@@ -579,16 +596,26 @@ def generate_motion_file(motion_provider, prompt, output_dir, rotation_solver):
     root_pos_isaac = pos_isaac_20[:, 0, :]  # [T_20, 3] — Z-up
 
     # ---------------------------------------------------------------
-    # Rotation pipeline: analytical IK from Isaac-space positions
+    # Optional bone-length retargeting + analytical IK
     # ---------------------------------------------------------------
-    # The diffusion model's 6D rotations (hml_raw[67:193]) are unreliable
-    # for arm joints — they produce T-pose arms while positions show correct
-    # arm-down poses. Instead, derive rotations from positions via analytical
-    # IK, which guarantees position-rotation consistency.
-    from closd_isaaclab.diffusion.robot_state_builder import analytical_ik
+    from closd_isaaclab.diffusion.robot_state_builder import analytical_ik, retarget_bone_lengths
 
     ki = rotation_solver.kinematic_info
-    global_rot_mjcf = analytical_ik(pos_isaac_20, ki)  # [T_20, 24, 3, 3]
+
+    if retarget:
+        # The diffusion model (HumanML3D) uses a different skeleton than the
+        # MJCF file — bone lengths can differ significantly.  Retarget the
+        # diffused positions to MJCF bone lengths (preserving bone directions)
+        # so that the IK→FK roundtrip is exact and red balls match the tracker.
+        pos_for_ik = retarget_bone_lengths(pos_isaac_20, ki)
+        retarget_diff = (pos_for_ik - pos_isaac_20).norm(dim=-1).mean()
+        log.info("  Retarget diff: %.4f m (mean per-joint)", retarget_diff.item())
+    else:
+        pos_for_ik = pos_isaac_20
+
+    root_pos_isaac = pos_for_ik[:, 0, :]  # [T_20, 3]
+
+    global_rot_mjcf = analytical_ik(pos_for_ik, ki)  # [T_20, 24, 3, 3]
 
     # Extract MJCF-compatible local joint rotations
     joint_rot_mjcf = compute_joint_rot_mats_from_global_mats(
@@ -939,7 +966,7 @@ def run_diffusion_only(args):
         log.info("  FK consistency  : %.4f m", consistency)
 
     # Build RobotState
-    builder = init_robot_state_builder(rotation_solver)
+    builder = init_robot_state_builder(rotation_solver, retarget=args.retarget_bone_lengths)
     builder.build(positions, hml_raw)
     state = builder.get_state_at_frames(list(range(min(5, positions.shape[1]))))
     log.info(
@@ -974,6 +1001,18 @@ def main():
         run_diffusion_only(args)
         return
 
+    # ----- Pre-generated motion file shortcut -----
+    if args.motion_file:
+        import os
+        if not os.path.exists(args.motion_file):
+            log.error("Motion file not found: %s", args.motion_file)
+            return
+        log.info("Using pre-generated motion file: %s", args.motion_file)
+        rc = run_with_motion_file(args.motion_file, args)
+        if rc != 0:
+            log.error("Tracker exited with code %d", rc)
+        return
+
     # ===== Full pipeline =====
     # Architecture: generate .motion file from diffusion, then use ProtoMotions'
     # standard inference pipeline (same as verify_tracking.py). This ensures
@@ -987,7 +1026,8 @@ def main():
 
     # Phase 3: Generate diffusion motion → .motion file
     motion_path = generate_motion_file(
-        motion_provider, args.prompt, "outputs/closd_pipeline", rotation_solver
+        motion_provider, args.prompt, "outputs/closd_pipeline", rotation_solver,
+        retarget=args.retarget_bone_lengths,
     )
 
     # Phase 4: Run tracker with .motion file via standard ProtoMotions pipeline
