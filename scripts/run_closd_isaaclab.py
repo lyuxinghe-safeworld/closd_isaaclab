@@ -533,6 +533,12 @@ def generate_initial_motion(motion_provider, robot_state_builder, prompt, device
     pos_isaac_20 = ct.smpl_to_isaac(positions_smpl[0])
     pos_isaac_30 = fps_convert(pos_isaac_20.unsqueeze(0), 20, 30)[0]
 
+    # Prepend 2 seconds of still pose for stabilization
+    STABILIZE_FRAMES = 60  # 2 seconds at 30fps
+    still_frame = pos_isaac_30[0:1].expand(STABILIZE_FRAMES, -1, -1)  # repeat first frame
+    pos_isaac_30 = torch.cat([still_frame, pos_isaac_30], dim=0)
+    log.info("  Prepended %d stabilization frames (%.1fs)", STABILIZE_FRAMES, STABILIZE_FRAMES / 30.0)
+
     # Build the robot_state_builder with positions (and HML for rotations)
     # Upsample hml_raw to match 30fps frame count for contact extraction
     robot_state_builder.build(
