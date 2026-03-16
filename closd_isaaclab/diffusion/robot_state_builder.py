@@ -88,13 +88,26 @@ class RobotStateBuilder:
         # 3. Extract rotations and dof_pos if rotation_solver is available
         self._dof_pos = None
         self._dof_vel = None
+        self._rotations = None      # [bs, T, num_bodies, 4] xyzw quaternions
+        self._ang_velocities = None  # [bs, T, num_bodies, 3]
         if self.rotation_solver is not None and hml_raw is not None:
-            _, dof_pos, _ = self.rotation_solver.solve(
+            local_rot_mats, dof_pos, _ = self.rotation_solver.solve(
                 positions, hml_raw=hml_raw, root_rot_wxyz=root_rot_wxyz
             )
             if dof_pos is not None:
                 self._dof_pos = dof_pos  # [bs, T, nq]
                 self._dof_vel = self._compute_velocities_1d(dof_pos)  # [bs, T, nq]
+
+            # Convert local rotation matrices to xyzw quaternions for RobotState
+            if local_rot_mats is not None:
+                from protomotions.utils.rotations import matrix_to_quaternion
+                bs, T = local_rot_mats.shape[:2]
+                rot_flat = local_rot_mats.reshape(-1, 3, 3)
+                quat_flat = matrix_to_quaternion(rot_flat, w_last=True)  # xyzw
+                self._rotations = quat_flat.reshape(bs, T, self.num_bodies, 4)
+                self._ang_velocities = torch.zeros(
+                    bs, T, self.num_bodies, 3, device=positions.device
+                )
 
         # 4. Extract foot contacts from hml_raw
         self._contacts = None
@@ -136,9 +149,14 @@ class RobotStateBuilder:
             else:
                 contacts = None
 
+        rot = self._rotations[:, idx, :, :] if self._rotations is not None else None
+        ang_vel = self._ang_velocities[:, idx, :, :] if self._ang_velocities is not None else None
+
         return {
             "rigid_body_pos": pos,
+            "rigid_body_rot": rot,
             "rigid_body_vel": vel,
+            "rigid_body_ang_vel": ang_vel,
             "dof_pos": dof_pos,
             "dof_vel": dof_vel,
             "rigid_body_contacts": contacts,

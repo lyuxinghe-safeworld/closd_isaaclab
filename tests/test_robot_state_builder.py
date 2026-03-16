@@ -250,7 +250,7 @@ class TestOutputShapes:
         positions = _make_positions(bs, T)
         builder.build(positions)
         state = builder.get_state_at_frames(list(range(T)))
-        expected_keys = {"rigid_body_pos", "rigid_body_vel", "dof_pos", "dof_vel", "rigid_body_contacts"}
+        expected_keys = {"rigid_body_pos", "rigid_body_rot", "rigid_body_vel", "rigid_body_ang_vel", "dof_pos", "dof_vel", "rigid_body_contacts"}
         assert set(state.keys()) == expected_keys, \
             f"Missing keys: {expected_keys - set(state.keys())}"
 

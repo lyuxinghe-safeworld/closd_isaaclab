@@ -212,11 +212,31 @@ def init_diffusion(args) -> "DiffusionMotionProvider":
 # ===================================================================
 
 def init_rotation_solver(args):
-    """Initialize the RotationSolver."""
+    """Initialize the RotationSolver with kinematic_info for dof_pos extraction."""
     from closd_isaaclab.diffusion.rotation_solver import RotationSolver
 
     log.info("Initializing RotationSolver (mode=%s) ...", args.rotation_mode)
-    solver = RotationSolver(mode=args.rotation_mode, device="cuda")
+
+    # Load kinematic_info from ProtoMotions MJCF — needed to convert
+    # local rotation matrices to dof_pos via extract_qpos_from_transforms
+    kinematic_info = None
+    try:
+        from protomotions.components.pose_lib import extract_kinematic_info
+        mjcf_path = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__import__("protomotions").__file__))),
+            "protomotions", "data", "assets", "mjcf", "smpl_humanoid.xml",
+        )
+        if os.path.exists(mjcf_path):
+            kinematic_info = extract_kinematic_info(mjcf_path)
+            log.info("  Loaded kinematic_info from %s", mjcf_path)
+        else:
+            log.warning("  MJCF not found at %s — dof_pos will not be computed", mjcf_path)
+    except Exception as e:
+        log.warning("  Failed to load kinematic_info: %s", e)
+
+    solver = RotationSolver(
+        mode=args.rotation_mode, device="cuda", kinematic_info=kinematic_info
+    )
     return solver
 
 

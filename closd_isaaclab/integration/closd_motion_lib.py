@@ -155,15 +155,29 @@ class CLoSDMotionLib:
         # The builder uses batch size (bs) on dim 0. We collapse by selecting
         # the first batch element and returning per-env (index along dim 1 -> dim 0).
         rigid_body_pos = self._squeeze_batch(state_dict["rigid_body_pos"])
+        rigid_body_rot = self._squeeze_batch(state_dict.get("rigid_body_rot"))
         rigid_body_vel = self._squeeze_batch(state_dict["rigid_body_vel"])
+        rigid_body_ang_vel = self._squeeze_batch(state_dict.get("rigid_body_ang_vel"))
         dof_pos = self._squeeze_batch(state_dict.get("dof_pos"))
         dof_vel = self._squeeze_batch(state_dict.get("dof_vel"))
         rigid_body_contacts = self._squeeze_batch(state_dict.get("rigid_body_contacts"))
 
+        # Fallback: if rotations are missing, use identity quaternions (xyzw)
+        if rigid_body_rot is None and rigid_body_pos is not None:
+            n, nb = rigid_body_pos.shape[:2]
+            rigid_body_rot = torch.zeros(n, nb, 4, device=rigid_body_pos.device)
+            rigid_body_rot[..., 3] = 1.0  # w=1 in xyzw
+
+        # Fallback: if angular velocities are missing, use zeros
+        if rigid_body_ang_vel is None and rigid_body_pos is not None:
+            rigid_body_ang_vel = torch.zeros_like(rigid_body_pos)
+
         robot_state = RobotState(
             state_conversion=StateConversion.COMMON,
             rigid_body_pos=rigid_body_pos,
+            rigid_body_rot=rigid_body_rot,
             rigid_body_vel=rigid_body_vel,
+            rigid_body_ang_vel=rigid_body_ang_vel,
             dof_pos=dof_pos,
             dof_vel=dof_vel,
             rigid_body_contacts=rigid_body_contacts,
