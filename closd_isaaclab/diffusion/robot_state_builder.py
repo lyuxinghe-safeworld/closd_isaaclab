@@ -67,34 +67,64 @@ def _estimate_root_rotation(
     positions: Tensor,
     l_hip_idx: int,
     r_hip_idx: int,
+    torso_idx: int = -1,
 ) -> Tensor:
-    """Estimate the root (pelvis) global rotation from hip positions.
+    """Estimate the root (pelvis) global rotation from hip and spine positions.
 
-    Uses the L_Hip→R_Hip vector to determine the character's lateral axis,
-    then derives forward and up to form an orthonormal frame.  This avoids
-    the identity-root assumption that causes twist accumulation in the
-    spine chain when the character faces away from the MJCF rest direction.
+    Constructs the pelvis body frame from three anatomical cues:
+      - **Lateral axis**: L_Hip → R_Hip direction (left-to-right).
+      - **Up axis**: pelvis centre → Torso direction (captures forward lean
+        and side lean instead of assuming world-Z).
+      - **Forward axis**: cross(lateral, up), then re-orthogonalise.
+
+    When *torso_idx* is unavailable (< 0) or the pelvis→torso vector is
+    degenerate, falls back to world-Z as the up direction (yaw-only).
 
     Args:
         positions: [T, num_bodies, 3] world-frame joint positions.
         l_hip_idx: Body index of L_Hip in MJCF order.
         r_hip_idx: Body index of R_Hip in MJCF order.
+        torso_idx: Body index of Torso (direct child of Pelvis) in MJCF
+                   order.  Set to -1 to use the yaw-only fallback.
 
     Returns:
         [T, 3, 3] root rotation matrices (columns = [forward, lateral, up]).
     """
     T = positions.shape[0]
+    eps = 1e-8
+
+    # --- lateral axis (L_Hip → R_Hip) ---
     lateral = positions[:, l_hip_idx] - positions[:, r_hip_idx]  # [T, 3]
-    lateral[:, 2] = 0.0  # project onto horizontal plane
-    lateral = lateral / (lateral.norm(dim=-1, keepdim=True) + 1e-8)
+    lateral = lateral / (lateral.norm(dim=-1, keepdim=True) + eps)
 
-    up = torch.zeros(T, 3, device=positions.device, dtype=positions.dtype)
-    up[:, 2] = 1.0
+    # --- up axis ---
+    if torso_idx >= 0:
+        # Pelvis centre = midpoint of hips (more robust than body-0 position
+        # which may be at a slightly different location in some MJCF files).
+        pelvis_centre = (
+            positions[:, l_hip_idx] + positions[:, r_hip_idx]
+        ) / 2.0  # [T, 3]
+        up_raw = positions[:, torso_idx] - pelvis_centre  # [T, 3]
+        up_norm = up_raw.norm(dim=-1, keepdim=True)
 
-    forward = torch.linalg.cross(lateral, up)  # [T, 3]
-    forward = forward / (forward.norm(dim=-1, keepdim=True) + 1e-8)
+        # Fallback per-frame: if pelvis→torso is degenerate, use world Z
+        degenerate = (up_norm < 1e-4).squeeze(-1)  # [T]
+        up_raw = up_raw / (up_norm + eps)
+        if degenerate.any():
+            world_z = torch.zeros_like(up_raw)
+            world_z[:, 2] = 1.0
+            up_raw[degenerate] = world_z[degenerate]
+    else:
+        up_raw = torch.zeros(T, 3, device=positions.device, dtype=positions.dtype)
+        up_raw[:, 2] = 1.0
 
-    # Recompute lateral for strict orthogonality
+    # --- forward = lateral × up  (then orthogonalise) ---
+    forward = torch.linalg.cross(lateral, up_raw)  # [T, 3]
+    forward = forward / (forward.norm(dim=-1, keepdim=True) + eps)
+
+    # Recompute up & lateral for strict orthogonality
+    up = torch.linalg.cross(forward, lateral)
+    up = up / (up.norm(dim=-1, keepdim=True) + eps)
     lateral = torch.linalg.cross(up, forward)
 
     return torch.stack([forward, lateral, up], dim=-1)  # [T, 3, 3]
@@ -139,10 +169,13 @@ def analytical_ik(
 
     global_rots = torch.eye(3, device=dev).unsqueeze(0).expand(T, nb, 3, 3).clone()
 
-    # Estimate root rotation from hip positions
+    # Estimate root rotation from hip + torso positions
     l_hip_idx = ki.body_names.index("L_Hip")
     r_hip_idx = ki.body_names.index("R_Hip")
-    global_rots[:, 0] = _estimate_root_rotation(positions, l_hip_idx, r_hip_idx)
+    torso_idx = ki.body_names.index("Torso") if "Torso" in ki.body_names else -1
+    global_rots[:, 0] = _estimate_root_rotation(
+        positions, l_hip_idx, r_hip_idx, torso_idx=torso_idx,
+    )
 
     for i in range(nb):
         pi = ki.parent_indices[i]

@@ -607,30 +607,23 @@ def generate_motion_file(motion_provider, prompt, output_dir, rotation_solver):
     log.info("  FK vs diffusion position diff: %.4f m (mean per-joint)", fk_diff.item())
 
     # ---------------------------------------------------------------
-    # Extract remaining fields for .motion file
+    # Build .motion file from FK-consistent data
     # ---------------------------------------------------------------
-    # Use DIFFUSION positions for rigid_body_pos so the red ball markers
-    # match the diffusion skeleton video exactly (same source: recover_from_ric).
-    # Use FK-derived rotations for rigid_body_rot (correct facing direction
-    # from the rotation pipeline).
-    # The tracker weights positions (0.5) more than rotations (0.3), so it
-    # primarily follows the diffusion positions while maintaining correct
-    # orientation from the FK rotations.
+    # All fields come from the FK pipeline (fk_from_transforms_with_velocities)
+    # to guarantee mutual consistency: positions, rotations, velocities, and
+    # dof_pos are all derived from the same kinematic chain.
+    #
+    # The previous approach mixed diffusion positions with FK rotations,
+    # creating inconsistency that confused the tracker's position vs rotation
+    # tracking rewards.
 
-    # Fix height on diffusion positions: ensure feet above ground
-    min_z = pos_isaac_20[:, :, 2].min()
+    # FK positions with height fix: ensure feet above ground
+    fk_pos_fixed = fk_pos.clone()
+    min_z = fk_pos_fixed[:, :, 2].min()
     height_shift = max(0.015 - min_z.item(), 0.0)
-    pos_isaac_20_fixed = pos_isaac_20.clone()
-    pos_isaac_20_fixed[:, :, 2] += height_shift
+    fk_pos_fixed[:, :, 2] += height_shift
     if height_shift > 0:
         log.info("  Height fix: shifted Z by %.4f m", height_shift)
-
-    # Diffusion-based velocities (finite difference on diffusion positions)
-    diff_vel = torch.zeros_like(pos_isaac_20_fixed)
-    if T_20 >= 3:
-        diff_vel[1:-1] = (pos_isaac_20_fixed[2:] - pos_isaac_20_fixed[:-2]) * (20 / 2)
-        diff_vel[0] = (pos_isaac_20_fixed[1] - pos_isaac_20_fixed[0]) * 20
-        diff_vel[-1] = (pos_isaac_20_fixed[-1] - pos_isaac_20_fixed[-2]) * 20
 
     # Local rotation quaternions (MJCF order) for MotionLib interpolation
     local_rot_quat = matrix_to_quaternion(
@@ -659,14 +652,11 @@ def generate_motion_file(motion_provider, prompt, output_dir, rotation_solver):
     def _prepend_still(t, n):
         return torch.cat([t[0:1].expand(n, *t.shape[1:]), t])
 
-    # rigid_body_pos: diffusion positions (matches skeleton video)
-    # rigid_body_rot: FK-derived rotations (correct facing from rotation pipeline)
-    # rigid_body_vel: diffusion-based velocities (consistent with positions)
-    # rigid_body_ang_vel: FK-derived angular velocities (consistent with rotations)
+    # All fields from FK pipeline — mutually consistent
     motion_dict = {
-        "rigid_body_pos": _prepend_still(pos_isaac_20_fixed, STAB),
+        "rigid_body_pos": _prepend_still(fk_pos_fixed, STAB),
         "rigid_body_rot": _prepend_still(motion.rigid_body_rot, STAB),
-        "rigid_body_vel": torch.cat([torch.zeros(STAB, 24, 3), diff_vel]),
+        "rigid_body_vel": torch.cat([torch.zeros(STAB, 24, 3), motion.rigid_body_vel]),
         "rigid_body_ang_vel": torch.cat([torch.zeros(STAB, 24, 3), motion.rigid_body_ang_vel]),
         "dof_pos": _prepend_still(dof_pos, STAB),
         "dof_vel": torch.cat([torch.zeros(STAB, 69), dof_vel]),
