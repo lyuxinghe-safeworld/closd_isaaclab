@@ -506,6 +506,25 @@ def generate_initial_motion(motion_provider, robot_state_builder, prompt, device
     hml_raw = hml_raw.cpu()
     log.info("  Generated: %s positions, %s HML", list(positions_smpl.shape), list(hml_raw.shape))
 
+    # Save diffusion skeleton video for verification
+    output_dir = Path("outputs/closd_pipeline")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    torch.save(positions_smpl, output_dir / "xyz.pt")
+    torch.save(hml_raw, output_dir / "motion.pt")
+    try:
+        import re
+        slug = re.sub(r"[^a-z0-9]+", "_", prompt.lower()).strip("_")[:50]
+        mp4_path = output_dir / f"{slug}_skeleton.mp4"
+        try:
+            from standalone_t2m.render import render_xyz_motion
+            render_xyz_motion(positions_smpl, prompt, mp4_path, fps=20)
+        except Exception:
+            from scripts.verify_diffusion import _render_skeleton_fallback
+            _render_skeleton_fallback(positions_smpl[0].numpy(), mp4_path, prompt, fps=20)
+        log.info("  Saved skeleton video: %s", mp4_path)
+    except Exception as e:
+        log.warning("  Failed to render skeleton video: %s", e)
+
     ct = CoordTransform()
     T_20 = positions_smpl.shape[1]
     dt = 1.0 / 30.0

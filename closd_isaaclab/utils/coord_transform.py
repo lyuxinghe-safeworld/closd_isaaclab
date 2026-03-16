@@ -77,8 +77,10 @@ class CoordTransform:
         y180_rot = _ry(-math.pi)                   # Ry(-pi)
 
         # Full SMPL -> Isaac combined rotation
-        # chain: to_isaac_mat.T @ y180_rot @ smpl2sim_rot_mat
-        self.rot_mat: torch.Tensor = to_isaac_mat.T @ y180_rot @ smpl2sim_rot_mat
+        # CLoSD applies: pos @ smpl2sim.T, then pos @ y180.T, then pos @ to_isaac.T
+        # Combined: pos @ (to_isaac @ y180 @ smpl2sim).T
+        # So rot_mat is what we LEFT-multiply with pos (i.e. pos @ rot_mat)
+        self.rot_mat: torch.Tensor = (to_isaac_mat @ y180_rot @ smpl2sim_rot_mat).T
         self.rot_mat_inv: torch.Tensor = self.rot_mat.T  # orthogonal -> inverse == transpose
 
         # Pre-compute index tensors
