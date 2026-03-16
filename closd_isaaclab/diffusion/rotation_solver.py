@@ -262,10 +262,14 @@ class RotationSolver:
             else:
                 root_pos_flat = torch.zeros(bs * T, 3, device=rot_flat.device)
 
-            # Extract qpos
-            dof_pos_flat = extract_qpos_from_transforms(
-                self.kinematic_info, root_pos_flat, rot_flat
-            )  # [bs*T, nq]
+            # Extract qpos (SMPL uses 3-DOF ball joints → exp_map decomposition)
+            # Returns [bs*T, Nq] where Nq = 3 (root pos) + 4 (root quat) + 69 (joints)
+            qpos_flat = extract_qpos_from_transforms(
+                self.kinematic_info, root_pos_flat, rot_flat,
+                multi_dof_decomposition_method="exp_map",
+            )  # [bs*T, 76]
+            # Strip root pos (3) + root quat (4) = first 7 elements → keep joint DOFs only
+            dof_pos_flat = qpos_flat[:, 7:]  # [bs*T, 69]
             dof_pos = dof_pos_flat.reshape(bs, T, -1)
 
             # FK consistency check

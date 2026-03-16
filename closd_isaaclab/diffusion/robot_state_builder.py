@@ -86,27 +86,54 @@ class RobotStateBuilder:
         self._velocities = self._compute_velocities(positions)  # [bs, T, num_bodies, 3]
 
         # 3. Extract rotations and dof_pos if rotation_solver is available
+        #    NOTE: hml_raw is at 20fps, positions are at 30fps. The solver works
+        #    at HML fps (20fps). We pass None for positions so the solver uses
+        #    zeros for root_pos (dof_pos depends on joint rotations, not root pos).
+        #    After solving, we upsample dof_pos/rotations from 20fps to 30fps.
         self._dof_pos = None
         self._dof_vel = None
         self._rotations = None      # [bs, T, num_bodies, 4] xyzw quaternions
         self._ang_velocities = None  # [bs, T, num_bodies, 3]
         if self.rotation_solver is not None and hml_raw is not None:
-            local_rot_mats, dof_pos, _ = self.rotation_solver.solve(
-                positions, hml_raw=hml_raw, root_rot_wxyz=root_rot_wxyz
-            )
-            if dof_pos is not None:
-                self._dof_pos = dof_pos  # [bs, T, nq]
-                self._dof_vel = self._compute_velocities_1d(dof_pos)  # [bs, T, nq]
+            from closd_isaaclab.utils.fps_convert import fps_convert
 
-            # Convert local rotation matrices to xyzw quaternions for RobotState
+            local_rot_mats, dof_pos, _ = self.rotation_solver.solve(
+                None, hml_raw=hml_raw, root_rot_wxyz=root_rot_wxyz
+            )
+
+            T_30 = positions.shape[1]
+            bs = positions.shape[0]
+
+            if dof_pos is not None:
+                # dof_pos is at 20fps — upsample to 30fps
+                dof_pos_30 = fps_convert(dof_pos, src_fps=20, tgt_fps=30)
+                # Trim or pad to match position frame count
+                if dof_pos_30.shape[1] > T_30:
+                    dof_pos_30 = dof_pos_30[:, :T_30]
+                elif dof_pos_30.shape[1] < T_30:
+                    pad = dof_pos_30[:, -1:].expand(-1, T_30 - dof_pos_30.shape[1], -1)
+                    dof_pos_30 = torch.cat([dof_pos_30, pad], dim=1)
+                self._dof_pos = dof_pos_30
+                self._dof_vel = self._compute_velocities_1d(dof_pos_30)
+
             if local_rot_mats is not None:
                 from protomotions.utils.rotations import matrix_to_quaternion
-                bs, T = local_rot_mats.shape[:2]
+                bs_r, T_20 = local_rot_mats.shape[:2]
                 rot_flat = local_rot_mats.reshape(-1, 3, 3)
                 quat_flat = matrix_to_quaternion(rot_flat, w_last=True)  # xyzw
-                self._rotations = quat_flat.reshape(bs, T, self.num_bodies, 4)
+                quat_20 = quat_flat.reshape(bs_r, T_20, self.num_bodies, 4)
+                # Upsample quaternions from 20fps to 30fps
+                quat_30 = fps_convert(quat_20, src_fps=20, tgt_fps=30)
+                # Renormalize after interpolation
+                quat_30 = quat_30 / (quat_30.norm(dim=-1, keepdim=True) + 1e-8)
+                if quat_30.shape[1] > T_30:
+                    quat_30 = quat_30[:, :T_30]
+                elif quat_30.shape[1] < T_30:
+                    pad = quat_30[:, -1:].expand(-1, T_30 - quat_30.shape[1], -1, -1)
+                    quat_30 = torch.cat([quat_30, pad], dim=1)
+                self._rotations = quat_30
                 self._ang_velocities = torch.zeros(
-                    bs, T, self.num_bodies, 3, device=positions.device
+                    bs, T_30, self.num_bodies, 3, device=positions.device
                 )
 
         # 4. Extract foot contacts from hml_raw
