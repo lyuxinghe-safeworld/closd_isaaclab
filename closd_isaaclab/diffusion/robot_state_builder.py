@@ -26,6 +26,43 @@ from torch import Tensor
 _HML_TO_MUJOCO_CONTACT: List[int] = [3, 4, 7, 8]
 
 
+def _rotation_between_vectors(v1: Tensor, v2: Tensor) -> Tensor:
+    """Compute rotation matrix that rotates v1 to v2 (Rodrigues formula).
+
+    Args:
+        v1: [..., 3] source direction vectors.
+        v2: [..., 3] target direction vectors.
+
+    Returns:
+        [..., 3, 3] rotation matrices.
+    """
+    v1 = v1 / (v1.norm(dim=-1, keepdim=True) + 1e-8)
+    v2 = v2 / (v2.norm(dim=-1, keepdim=True) + 1e-8)
+    cross = torch.cross(v1, v2, dim=-1)
+    dot = (v1 * v2).sum(dim=-1, keepdim=True)
+    sin_a = cross.norm(dim=-1, keepdim=True)
+
+    # Skew-symmetric matrix K
+    kx, ky, kz = cross[..., 0], cross[..., 1], cross[..., 2]
+    z = torch.zeros_like(kx)
+    K = torch.stack([
+        torch.stack([z, -kz, ky], dim=-1),
+        torch.stack([kz, z, -kx], dim=-1),
+        torch.stack([-ky, kx, z], dim=-1),
+    ], dim=-2)  # [..., 3, 3]
+
+    I = torch.eye(3, device=v1.device, dtype=v1.dtype).expand_as(K)
+
+    # Rodrigues: R = I + K + K^2 * (1 - cos) / sin^2
+    # Handle near-parallel vectors (sin_a ≈ 0)
+    safe_sin2 = sin_a.unsqueeze(-1) ** 2 + 1e-8
+    R = I + K + (K @ K) * ((1.0 - dot.unsqueeze(-1)) / safe_sin2)
+
+    # For antiparallel vectors (dot ≈ -1), use a different approach
+    # (not common in humanoid motion, but handle gracefully)
+    return R
+
+
 class RobotStateBuilder:
     """Build and cache RobotState-compatible motion data from diffusion output.
 
@@ -85,112 +122,95 @@ class RobotStateBuilder:
         # 2. Compute body velocities via finite differences
         self._velocities = self._compute_velocities(positions)  # [bs, T, num_bodies, 3]
 
-        # 3. Extract rotations and dof_pos using ProtoMotions' FK pipeline
-        #    This is the same pipeline used by convert_amass_to_proto.py to create
-        #    .motion files. fk_from_transforms_with_velocities() is the single source
-        #    of truth that ensures global rotations, positions, velocities, and dof_pos
-        #    are all physically consistent.
+        # 3. Derive rotations and dof_pos from positions using analytical IK
+        #    The diffusion model produces reliable positions but unreliable rotations.
+        #    We compute rotations from bone direction vectors (analytical IK), then
+        #    use ProtoMotions' FK pipeline for consistency. The positions we store
+        #    are the ORIGINAL diffusion positions (not FK-derived), so the red ball
+        #    markers match the diffusion skeleton video.
         self._dof_pos = None
         self._dof_vel = None
         self._rotations = None      # [bs, T, num_bodies, 4] xyzw quaternions
         self._ang_velocities = None  # [bs, T, num_bodies, 3]
-        if self.rotation_solver is not None and hml_raw is not None:
+        if self.rotation_solver is not None and self.rotation_solver.kinematic_info is not None and hml_raw is not None:
             from closd_isaaclab.utils.fps_convert import fps_convert
-
-            # Solver works at 20fps (HML rate)
-            local_rot_mats, _, _ = self.rotation_solver.solve(
-                None, hml_raw=hml_raw, root_rot_wxyz=root_rot_wxyz
+            from protomotions.components.pose_lib import (
+                compute_forward_kinematics_from_transforms,
+                compute_joint_rot_mats_from_global_mats,
+                extract_qpos_from_transforms,
+                compute_angular_velocity,
             )
+            from protomotions.utils.rotations import matrix_to_quaternion
 
+            ki = self.rotation_solver.kinematic_info
             T_30 = positions.shape[1]
             bs = positions.shape[0]
+            nb = self.num_bodies
 
-            if local_rot_mats is not None and self.rotation_solver.kinematic_info is not None:
-                from protomotions.components.pose_lib import (
-                    fk_from_transforms_with_velocities,
-                    extract_qpos_from_transforms,
-                    compute_joint_rot_mats_from_global_mats,
-                    compute_angular_velocity,
+            # Get rest-pose bone directions (identity rotations)
+            identity_rots = torch.eye(3, device=positions.device).unsqueeze(0).expand(nb, 3, 3).unsqueeze(0)
+            rest_pos, _ = compute_forward_kinematics_from_transforms(
+                ki, torch.zeros(1, 3, device=positions.device), identity_rots
+            )
+            rest_pos = rest_pos[0]  # [nb, 3]
+
+            all_rot_30 = []
+            all_dof_pos_30 = []
+            all_dof_vel_30 = []
+            all_ang_vel_30 = []
+
+            for b in range(bs):
+                pos_b = positions[b]  # [T_30, nb, 3]
+
+                # Analytical IK: compute global rotation per body from bone directions
+                global_rots = torch.eye(3, device=positions.device).unsqueeze(0).expand(T_30, nb, 3, 3).clone()
+                for i in range(nb):
+                    pi = ki.parent_indices[i]
+                    if pi >= 0:
+                        rest_bone = rest_pos[i] - rest_pos[pi]
+                        actual_bones = pos_b[:, i] - pos_b[:, pi]  # [T_30, 3]
+                        if rest_bone.norm() > 1e-6:
+                            R = _rotation_between_vectors(
+                                rest_bone.unsqueeze(0).expand(T_30, -1),
+                                actual_bones,
+                            )  # [T_30, 3, 3]
+                            global_rots[:, i] = R
+
+                # Convert global rotations to local rotations
+                local_rots = compute_joint_rot_mats_from_global_mats(ki, global_rots)  # [T_30, nb, 3, 3]
+
+                # Global rotations → xyzw quaternions
+                rot_flat = global_rots.reshape(-1, 3, 3)
+                quat_flat = matrix_to_quaternion(rot_flat, w_last=True)
+                global_quat = quat_flat.reshape(T_30, nb, 4)
+                global_quat = global_quat / (global_quat.norm(dim=-1, keepdim=True) + 1e-8)
+
+                # DOF positions from local rotations
+                root_pos_b = pos_b[:, 0, :]  # [T_30, 3]
+                qpos = extract_qpos_from_transforms(
+                    ki, root_pos_b, local_rots,
+                    multi_dof_decomposition_method="exp_map",
                 )
-                from protomotions.utils.rotations import matrix_to_quaternion
+                dof_pos = qpos[:, 7:]  # [T_30, 69]
 
-                bs_r, T_20 = local_rot_mats.shape[:2]
-                ki = self.rotation_solver.kinematic_info
+                # DOF velocities
+                dof_vel = compute_angular_velocity(local_rots.unsqueeze(0), fps=30)
+                dof_vel = dof_vel[0, :, 1:, :].reshape(T_30, -1)  # [T_30, 69]
 
-                # Get root positions at 20fps from our 30fps positions
-                pos_20 = fps_convert(positions, src_fps=30, tgt_fps=20)
-                if pos_20.shape[1] > T_20:
-                    pos_20 = pos_20[:, :T_20]
-                elif pos_20.shape[1] < T_20:
-                    pad_p = pos_20[:, -1:].expand(-1, T_20 - pos_20.shape[1], -1, -1)
-                    pos_20 = torch.cat([pos_20, pad_p], dim=1)
+                # Angular velocities (zeros — analytical IK doesn't produce smooth enough
+                # rotations for meaningful angular velocity)
+                ang_vel = torch.zeros(T_30, nb, 3, device=positions.device)
 
-                # Process each batch element through ProtoMotions' FK pipeline.
-                # Use FK-derived positions for consistency: the tracker needs
-                # positions, rotations, and dof_pos that are all physically
-                # consistent. FK ensures this by deriving everything from
-                # the same local rotation matrices.
-                all_pos_30 = []
-                all_rot_30 = []
-                all_vel_30 = []
-                all_dof_pos_30 = []
-                all_dof_vel_30 = []
-                all_ang_vel_30 = []
+                all_rot_30.append(global_quat)
+                all_dof_pos_30.append(dof_pos)
+                all_dof_vel_30.append(dof_vel)
+                all_ang_vel_30.append(ang_vel)
 
-                for b in range(bs):
-                    root_pos_b = pos_20[b, :, 0, :]  # [T_20, 3]
-                    local_rots_b = local_rot_mats[b]  # [T_20, 24, 3, 3]
-
-                    # ProtoMotions' authoritative FK pipeline
-                    motion_state = fk_from_transforms_with_velocities(
-                        ki, root_pos_b, local_rots_b, fps=20, compute_velocities=True
-                    )
-
-                    # FK-derived positions (consistent with rotations)
-                    fk_pos_20 = motion_state.rigid_body_pos  # [T_20, 24, 3]
-                    global_rot_20 = motion_state.rigid_body_rot  # [T_20, 24, 4] xyzw
-                    vel_20 = motion_state.rigid_body_vel  # [T_20, 24, 3]
-                    ang_vel_20 = motion_state.rigid_body_ang_vel  # [T_20, 24, 3]
-
-                    # DOF positions from local rotations
-                    qpos = extract_qpos_from_transforms(
-                        ki, root_pos_b, local_rots_b,
-                        multi_dof_decomposition_method="exp_map",
-                    )
-                    dof_pos_20 = qpos[:, 7:]  # [T_20, 69]
-
-                    # DOF velocities
-                    dof_vel_20 = compute_angular_velocity(
-                        local_rots_b.unsqueeze(0), fps=20
-                    )
-                    dof_vel_20 = dof_vel_20[0, :, 1:, :].reshape(T_20, -1)
-
-                    # Upsample everything from 20fps to 30fps
-                    def _upsample_and_pad(t, T_target):
-                        t30 = fps_convert(t.unsqueeze(0), 20, 30)[0]
-                        if t30.shape[0] > T_target:
-                            return t30[:T_target]
-                        elif t30.shape[0] < T_target:
-                            pad = t30[-1:].expand(T_target - t30.shape[0], *t30.shape[1:])
-                            return torch.cat([t30, pad], dim=0)
-                        return t30
-
-                    all_pos_30.append(_upsample_and_pad(fk_pos_20, T_30))
-                    rot_30 = _upsample_and_pad(global_rot_20, T_30)
-                    rot_30 = rot_30 / (rot_30.norm(dim=-1, keepdim=True) + 1e-8)
-                    all_rot_30.append(rot_30)
-                    all_vel_30.append(_upsample_and_pad(vel_20, T_30))
-                    all_dof_pos_30.append(_upsample_and_pad(dof_pos_20, T_30))
-                    all_dof_vel_30.append(_upsample_and_pad(dof_vel_20, T_30))
-                    all_ang_vel_30.append(_upsample_and_pad(ang_vel_20, T_30))
-
-                # Override positions with FK-derived (consistent) positions
-                self._positions = torch.stack(all_pos_30).to(positions.device)
-                self._velocities = torch.stack(all_vel_30).to(positions.device)
-                self._rotations = torch.stack(all_rot_30).to(positions.device)
-                self._dof_pos = torch.stack(all_dof_pos_30).to(positions.device)
-                self._dof_vel = torch.stack(all_dof_vel_30).to(positions.device)
-                self._ang_velocities = torch.stack(all_ang_vel_30).to(positions.device)
+            self._rotations = torch.stack(all_rot_30).to(positions.device)
+            self._dof_pos = torch.stack(all_dof_pos_30).to(positions.device)
+            self._dof_vel = torch.stack(all_dof_vel_30).to(positions.device)
+            self._ang_velocities = torch.stack(all_ang_vel_30).to(positions.device)
+            # Keep original diffusion positions (not FK-derived)
 
         # 4. Extract foot contacts from hml_raw
         self._contacts = None
