@@ -107,9 +107,11 @@ class DiffusionMotionProvider:
         hml_raw : torch.Tensor
             [1, T, 263] unnormalized HumanML3D features.
         """
-        from standalone_t2m.decode import decode_to_xyz
         from standalone_t2m.generation import compose_output_motion, generate_motion
         from standalone_t2m.prefix.standing import build_standing_prefix
+        from standalone_t2m.vendor.diffusion_planner.data_loaders.humanml.scripts.motion_process import (
+            recover_from_ric,
+        )
 
         # 1. Build prefix
         if prefix_mode == "standing":
@@ -132,19 +134,23 @@ class DiffusionMotionProvider:
         # 4. Compose full motion (prefix + generated)
         full_motion = compose_output_motion(prefix, generated)
 
-        # 5. Decode to XYZ joint positions
-        positions = decode_to_xyz(
-            full_motion,
-            self.mean.cpu(),
-            self.std.cpu(),
-        )  # [1, T, 22, 3]
-
-        # 6. Get raw (unnormalized) HML features
+        # 5. Unnormalize to raw HML features
         # full_motion shape: [1, 263, 1, T] -> squeeze feat dim, permute to [1, T, 263]
         hml_norm = full_motion.squeeze(2).permute(0, 2, 1)  # [1, T, 263]
         mean_dev = self.mean.to(hml_norm.device)
         std_dev = self.std.to(hml_norm.device)
         hml_raw = hml_norm * std_dev.unsqueeze(0).unsqueeze(0) + mean_dev.unsqueeze(0).unsqueeze(0)
+
+        # 6. Remove prefix velocity bias from root XZ velocity (HML dims 1-2)
+        # The standing prefix (normalized zeros = dataset mean) carries the
+        # average forward velocity of the HumanML3D dataset (~0.17 m/s).
+        # Measure this bias from the prefix frames and subtract it so that
+        # a truly static prefix produces zero root displacement.
+        prefix_vel_bias = hml_raw[:, :self.context_len, 1:3].mean(dim=1, keepdim=True)  # [1, 1, 2]
+        hml_raw[:, :, 1:3] = hml_raw[:, :, 1:3] - prefix_vel_bias
+
+        # 7. Decode corrected HML to XYZ joint positions
+        positions = recover_from_ric(hml_raw, 22)  # [1, T, 22, 3]
 
         return positions, hml_raw
 
