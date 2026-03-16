@@ -487,32 +487,38 @@ def build_protomotions_env_and_agent(
 # Phase 6: Closed-loop execution
 # ===================================================================
 
-def generate_initial_motion(motion_provider, robot_state_builder, prompt, device):
-    """Generate initial diffusion motion and populate the RobotStateBuilder.
+def generate_motion_file(motion_provider, prompt, output_dir, rotation_solver):
+    """Generate diffusion motion and save as ProtoMotions .motion file.
 
-    This must be called before the tracking loop so that CLoSDMotionLib
-    has real motion data to serve (not zeros).
+    Uses ProtoMotions' fk_from_transforms_with_velocities() to create
+    FK-consistent motion data — the same pipeline used to create .motion
+    files from AMASS. This guarantees all fields (positions, rotations,
+    dof_pos, velocities) are physically consistent.
+
+    Returns path to the .motion file.
     """
-    import numpy as np
+    import re
     from closd_isaaclab.utils.coord_transform import CoordTransform
-    from closd_isaaclab.utils.fps_convert import fps_convert
-    from closd_isaaclab.diffusion.rotation_solver import cont6d_to_matrix, wxyz_quat_to_matrix
-    from closd_isaaclab.diffusion.hml_conversion import recover_root_rot_pos
-    from protomotions.utils.rotations import matrix_to_quaternion, quat_to_exp_map
+    from protomotions.components.pose_lib import (
+        fk_from_transforms_with_velocities,
+        extract_qpos_from_transforms,
+        compute_angular_velocity,
+    )
+    from protomotions.utils.rotations import matrix_to_quaternion
 
-    log.info("Generating initial diffusion motion for: '%s'", prompt)
+    ki = rotation_solver.kinematic_info
+
+    log.info("Generating diffusion motion for: '%s'", prompt)
     positions_smpl, hml_raw = motion_provider.generate_standalone(prompt, num_seconds=8.0)
     positions_smpl = positions_smpl.cpu()
     hml_raw = hml_raw.cpu()
     log.info("  Generated: %s positions, %s HML", list(positions_smpl.shape), list(hml_raw.shape))
 
-    # Save diffusion skeleton video for verification
-    output_dir = Path("outputs/closd_pipeline")
+    # Save skeleton video
+    output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     torch.save(positions_smpl, output_dir / "xyz.pt")
-    torch.save(hml_raw, output_dir / "motion.pt")
     try:
-        import re
         slug = re.sub(r"[^a-z0-9]+", "_", prompt.lower()).strip("_")[:50]
         mp4_path = output_dir / f"{slug}_skeleton.mp4"
         try:
@@ -525,66 +531,108 @@ def generate_initial_motion(motion_provider, robot_state_builder, prompt, device
     except Exception as e:
         log.warning("  Failed to render skeleton video: %s", e)
 
+    # Get local rotations from HML (20fps)
+    local_rot_mats, _, _ = rotation_solver.solve(None, hml_raw=hml_raw)
+    T_20 = local_rot_mats.shape[1]
+
+    # Convert positions to Isaac coords for root_pos
     ct = CoordTransform()
-    T_20 = positions_smpl.shape[1]
-    dt = 1.0 / 30.0
+    pos_isaac_20 = ct.smpl_to_isaac(positions_smpl[0])[:T_20]  # [T_20, 24, 3]
+    root_pos = pos_isaac_20[:, 0, :]  # [T_20, 3]
 
-    # Positions: SMPL 22-joint -> Isaac 24-joint, 20fps -> 30fps
-    pos_isaac_20 = ct.smpl_to_isaac(positions_smpl[0])
-    pos_isaac_30 = fps_convert(pos_isaac_20.unsqueeze(0), 20, 30)[0]
-
-    # Prepend 2 seconds of still pose for stabilization
-    STABILIZE_FRAMES = 60  # 2 seconds at 30fps
-    still_frame = pos_isaac_30[0:1].expand(STABILIZE_FRAMES, -1, -1)  # repeat first frame
-    pos_isaac_30 = torch.cat([still_frame, pos_isaac_30], dim=0)
-    log.info("  Prepended %d stabilization frames (%.1fs)", STABILIZE_FRAMES, STABILIZE_FRAMES / 30.0)
-
-    # Build the robot_state_builder with positions (and HML for rotations)
-    # Upsample hml_raw to match 30fps frame count for contact extraction
-    robot_state_builder.build(
-        pos_isaac_30.unsqueeze(0).to(device),
-        hml_raw.to(device),
+    # Use ProtoMotions' FK pipeline — guaranteed consistent
+    motion = fk_from_transforms_with_velocities(
+        ki, root_pos, local_rot_mats[0], fps=20, compute_velocities=True
     )
 
-    T_30 = pos_isaac_30.shape[0]
-    log.info("  RobotStateBuilder populated: %d frames at 30fps (%.1fs)", T_30, T_30 / 30.0)
+    # Local rotation quaternions for MotionLib interpolation
+    local_rot_quat = matrix_to_quaternion(
+        local_rot_mats[0].reshape(-1, 3, 3), w_last=True
+    ).reshape(T_20, 24, 4)
 
-    # Update motion_lib lengths to match generated motion
-    return T_30
+    # DOF positions and velocities
+    qpos = extract_qpos_from_transforms(
+        ki, root_pos, local_rot_mats[0], multi_dof_decomposition_method="exp_map"
+    )
+    dof_pos = qpos[:, 7:]  # [T_20, 69]
+    dof_vel = compute_angular_velocity(local_rot_mats[0].unsqueeze(0), fps=20)
+    dof_vel = dof_vel[0, :, 1:, :].reshape(T_20, -1)  # [T_20, 69]
+
+    # Contacts from HML
+    hml = hml_raw[0][:T_20]
+    fc = hml[:, 259:263]
+    contacts = torch.zeros(T_20, 24)
+    contacts[:, 3] = (fc[:, 0] > 0.5).float()
+    contacts[:, 4] = (fc[:, 1] > 0.5).float()
+    contacts[:, 7] = (fc[:, 2] > 0.5).float()
+    contacts[:, 8] = (fc[:, 3] > 0.5).float()
+
+    # Prepend stabilization frames (3 seconds at 20fps = 60 frames)
+    STAB = 60
+    def _prepend_still(t, n):
+        return torch.cat([t[0:1].expand(n, *t.shape[1:]), t])
+
+    motion_dict = {
+        "rigid_body_pos": _prepend_still(motion.rigid_body_pos, STAB),
+        "rigid_body_rot": _prepend_still(motion.rigid_body_rot, STAB),
+        "rigid_body_vel": torch.cat([torch.zeros(STAB, 24, 3), motion.rigid_body_vel]),
+        "rigid_body_ang_vel": torch.cat([torch.zeros(STAB, 24, 3), motion.rigid_body_ang_vel]),
+        "dof_pos": _prepend_still(dof_pos, STAB),
+        "dof_vel": torch.cat([torch.zeros(STAB, 69), dof_vel]),
+        "rigid_body_contacts": _prepend_still(contacts, STAB),
+        "local_rigid_body_rot": _prepend_still(local_rot_quat, STAB),
+        "fps": 20,
+    }
+
+    motion_path = str(output_dir / "generated.motion")
+    torch.save(motion_dict, motion_path)
+    T_total = motion_dict["rigid_body_pos"].shape[0]
+    log.info("  Saved .motion: %s (%d frames, %.1fs)", motion_path, T_total, T_total / 20)
+    log.info("  Stabilization prefix: %d frames (%.1fs)", STAB, STAB / 20)
+
+    return motion_path
 
 
-def run_closed_loop(env, agent, closd_manager, motion_provider, robot_state_builder, closd_motion_lib, args):
-    """Run the closed-loop CLoSD pipeline.
+def run_with_motion_file(motion_path, args):
+    """Run ProtoMotions tracker with a .motion file via verify_tracking approach.
 
-    Steps:
-      1. Generate initial diffusion motion and populate RobotStateBuilder
-      2. Run ProtoMotions policy loop (tracker queries CLoSDMotionLib for reference)
+    This uses the standard ProtoMotions inference pipeline — the same
+    code path that verify_tracking.py uses successfully.
     """
-    device = next(iter(env.simulator._robot.data.body_pos_w.device for _ in [0]))
+    import subprocess
 
     log.info("=" * 60)
-    log.info("Starting closed-loop CLoSD pipeline")
-    log.info("  prompt         : %s", args.prompt)
-    log.info("  episode_length : %d steps", args.episode_length)
-    log.info("  num_envs       : %d", args.num_envs)
+    log.info("Running tracker with generated .motion file")
+    log.info("  motion_file: %s", motion_path)
+    log.info("  prompt     : %s", args.prompt)
     log.info("=" * 60)
 
-    # Phase 6a: Generate initial motion and populate builder
-    num_frames = generate_initial_motion(
-        motion_provider, robot_state_builder, args.prompt, device
-    )
+    cmd = [
+        sys.executable,
+        str(Path.home() / "code" / "ProtoMotions" / "protomotions" / "inference_agent.py"),
+        "--checkpoint", args.tracker_checkpoint,
+        "--motion-file", motion_path,
+        "--num-envs", str(args.num_envs),
+        "--simulator", args.simulator,
+    ]
+    if args.headless:
+        cmd.append("--headless")
 
-    # Update motion_lib duration so get_done_tracks works correctly
-    closd_motion_lib.motion_lengths = torch.tensor(
-        [num_frames / 30.0], device=device
-    )
+    # Set up env for ProtoMotions
+    env = os.environ.copy()
+    proto_root = Path.home() / "code" / "ProtoMotions"
+    isaacsim_lib = Path.home() / "code" / "env_isaaclab" / "lib" / "python3.11" / "site-packages" / "isaacsim"
+    omniclient_dir = isaacsim_lib / "kit" / "extscore" / "omni.client.lib" / "bin"
+    if omniclient_dir.exists():
+        env["LD_LIBRARY_PATH"] = str(omniclient_dir) + ":" + env.get("LD_LIBRARY_PATH", "")
+    env["NCCL_IB_DISABLE"] = "1"
+    env["NCCL_NET"] = "Socket"
+    env.setdefault("MASTER_ADDR", "127.0.0.1")
+    env.setdefault("MASTER_PORT", "29500")
 
-    log.info("Running tracker policy...")
-    try:
-        agent.evaluator.simple_test_policy(collect_metrics=True)
-    except Exception as e:
-        log.error("Inference loop failed: %s", e)
-        raise
+    log.info("Running: %s", " ".join(cmd))
+    result = subprocess.run(cmd, cwd=str(proto_root), env=env)
+    return result.returncode
 
 
 # ===================================================================
@@ -666,44 +714,25 @@ def main():
         return
 
     # ===== Full pipeline =====
+    # Architecture: generate .motion file from diffusion, then use ProtoMotions'
+    # standard inference pipeline (same as verify_tracking.py). This ensures
+    # FK-consistent reference data that the tracker can actually track.
 
     # Phase 1: Diffusion model
     motion_provider = init_diffusion(args)
 
-    # Phase 2: Rotation solver + RobotStateBuilder
+    # Phase 2: Rotation solver (for local rotation extraction from HML 6D)
     rotation_solver = init_rotation_solver(args)
-    robot_state_builder = init_robot_state_builder(rotation_solver)
 
-    # Phase 3: Load tracker configs
-    tracker_configs = load_tracker_configs(args.tracker_checkpoint)
-
-    # Phase 4: CLoSDMotionLib + CLoSDMotionManager
-    closd_motion_lib = init_closd_motion_lib(robot_state_builder, device="cuda")
-    closd_manager = init_closd_motion_manager(
-        motion_lib=closd_motion_lib,
-        motion_provider=motion_provider,
-        robot_state_builder=robot_state_builder,
-        text_prompt=args.prompt,
-        num_envs=args.num_envs,
-        env_dt=1.0 / 30.0,
-        pred_len_20fps=motion_provider.pred_len,
-        device="cuda",
+    # Phase 3: Generate diffusion motion → .motion file
+    motion_path = generate_motion_file(
+        motion_provider, args.prompt, "outputs/closd_pipeline", rotation_solver
     )
 
-    # Phase 5: ProtoMotions env + agent
-    log.info("Building ProtoMotions environment and agent ...")
-    env, agent, simulator, device = build_protomotions_env_and_agent(
-        tracker_configs=tracker_configs,
-        closd_motion_lib=closd_motion_lib,
-        args=args,
-    )
-
-    # Phase 6: Run closed-loop
-    run_closed_loop(
-        env, agent, closd_manager,
-        motion_provider, robot_state_builder, closd_motion_lib,
-        args,
-    )
+    # Phase 4: Run tracker with .motion file via standard ProtoMotions pipeline
+    rc = run_with_motion_file(motion_path, args)
+    if rc != 0:
+        log.error("Tracker exited with code %d", rc)
 
 
 if __name__ == "__main__":
