@@ -133,13 +133,17 @@ def main() -> None:
     # ------------------------------------------------------------------
     # 4. Render MP4
     # ------------------------------------------------------------------
-    from standalone_t2m.render import render_xyz_motion
-
     slug = slugify(args.prompt)
     mp4_path = output_dir / f"{slug}.mp4"
 
     print(f"Rendering animation to: {mp4_path}")
-    render_xyz_motion(positions, args.prompt, mp4_path, fps=fps)
+    try:
+        from standalone_t2m.render import render_xyz_motion
+        render_xyz_motion(positions, args.prompt, mp4_path, fps=fps)
+    except Exception as e:
+        print(f"  Vendored renderer failed ({type(e).__name__}: {e})")
+        print(f"  Using fallback renderer...")
+        _render_skeleton_fallback(positions[0].cpu().numpy(), mp4_path, args.prompt, fps=fps)
 
     # ------------------------------------------------------------------
     # 5. Print summary stats
@@ -154,6 +158,64 @@ def main() -> None:
     print(f"  Guidance  : {args.guidance}")
     print(f"  Output dir: {output_dir.resolve()}")
     print("=" * 60)
+
+
+def _render_skeleton_fallback(xyz: "np.ndarray", mp4_path: Path, title: str, fps: int = 20):
+    """Fallback matplotlib skeleton renderer when vendored code has compatibility issues.
+
+    Args:
+        xyz: [T, 22, 3] joint positions (numpy).
+        mp4_path: Output path.
+        title: Plot title.
+        fps: Frame rate.
+    """
+    import numpy as np
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.animation import FuncAnimation, FFMpegWriter
+
+    # HumanML3D kinematic chain (joint connectivity)
+    kinematic_chain = [
+        [0, 2, 5, 8, 11],      # right leg
+        [0, 1, 4, 7, 10],      # left leg
+        [0, 3, 6, 9, 12, 15],  # spine + head
+        [9, 14, 17, 19, 21],   # right arm
+        [9, 13, 16, 18, 20],   # left arm
+    ]
+    colors = ["#e74c3c", "#3498db", "#2ecc71", "#e67e22", "#9b59b6"]
+
+    T, J, _ = xyz.shape
+    fig = plt.figure(figsize=(6, 6))
+    ax = fig.add_subplot(111, projection="3d")
+
+    # Compute axis limits from data
+    mins = xyz.min(axis=(0, 1))
+    maxs = xyz.max(axis=(0, 1))
+    center = (mins + maxs) / 2
+    span = (maxs - mins).max() * 0.6
+
+    def update(frame):
+        ax.clear()
+        ax.set_title(f"{title}\nFrame {frame}/{T}", fontsize=10)
+        ax.set_xlim(center[0] - span, center[0] + span)
+        ax.set_ylim(center[1] - span, center[1] + span)
+        ax.set_zlim(center[2] - span, center[2] + span)
+        ax.set_xlabel("X")
+        ax.set_ylabel("Y")
+        ax.set_zlabel("Z")
+
+        pts = xyz[frame]
+        for chain, color in zip(kinematic_chain, colors):
+            chain_pts = pts[chain]
+            ax.plot3D(chain_pts[:, 0], chain_pts[:, 1], chain_pts[:, 2], color=color, linewidth=2)
+        ax.scatter3D(pts[:, 0], pts[:, 1], pts[:, 2], s=10, c="black", zorder=5)
+
+    ani = FuncAnimation(fig, update, frames=T, interval=1000 / fps)
+    writer = FFMpegWriter(fps=fps, bitrate=2000)
+    ani.save(str(mp4_path), writer=writer)
+    plt.close(fig)
+    print(f"  Saved: {mp4_path}")
 
 
 if __name__ == "__main__":
