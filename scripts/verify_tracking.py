@@ -77,11 +77,30 @@ def main():
     if args.headless:
         cmd.append("--headless")
 
+    # ProtoMotions uses relative paths for USD assets — must run from its root
+    protomotions_root = Path.home() / "code" / "ProtoMotions"
+
+    import os
+    env = os.environ.copy()
+
+    # Isaac Sim needs libomniclient.so on LD_LIBRARY_PATH
+    isaacsim_lib = Path.home() / "code" / "env_isaaclab" / "lib" / "python3.11" / "site-packages" / "isaacsim"
+    omniclient_dir = isaacsim_lib / "kit" / "extscore" / "omni.client.lib" / "bin"
+    if omniclient_dir.exists():
+        env["LD_LIBRARY_PATH"] = str(omniclient_dir) + ":" + env.get("LD_LIBRARY_PATH", "")
+
+    # NCCL fix for GCP VMs without InfiniBand
+    env["NCCL_IB_DISABLE"] = "1"
+    env["NCCL_NET"] = "Socket"
+    env.setdefault("MASTER_ADDR", "127.0.0.1")
+    env.setdefault("MASTER_PORT", "29500")
+
     print("Running command:")
-    print(" ".join(cmd))
+    print(f"  cwd: {protomotions_root}")
+    print(f"  cmd: {' '.join(cmd)}")
     print()
 
-    result = subprocess.run(cmd)
+    result = subprocess.run(cmd, cwd=str(protomotions_root), env=env)
     sys.exit(result.returncode)
 
 
