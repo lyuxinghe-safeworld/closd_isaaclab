@@ -487,22 +487,56 @@ def build_protomotions_env_and_agent(
 # Phase 6: Closed-loop execution
 # ===================================================================
 
+def _smpl_globals_from_locals(local_rot_mats: torch.Tensor) -> torch.Tensor:
+    """Compute SMPL global rotation matrices from SMPL local (parent-relative) rotations.
+
+    Chains through the SMPL kinematic tree (24 joints in SMPL order).
+
+    Parameters
+    ----------
+    local_rot_mats : Tensor
+        [T, 24, 3, 3] local rotation matrices in SMPL joint order.
+
+    Returns
+    -------
+    Tensor
+        [T, 24, 3, 3] global rotation matrices in SMPL joint order.
+    """
+    # SMPL parent indices (24 joints: 22 SMPL + 2 hands)
+    SMPL_PARENTS = [
+        -1, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 9, 9, 12, 13, 14, 16, 17, 18, 19, 20, 21
+    ]
+    T = local_rot_mats.shape[0]
+    global_rot = torch.zeros_like(local_rot_mats)
+    for i in range(24):
+        if SMPL_PARENTS[i] == -1:
+            global_rot[:, i] = local_rot_mats[:, i]
+        else:
+            global_rot[:, i] = global_rot[:, SMPL_PARENTS[i]] @ local_rot_mats[:, i]
+    return global_rot
+
+
 def generate_motion_file(motion_provider, prompt, output_dir, rotation_solver):
     """Generate diffusion motion and save as ProtoMotions .motion file.
 
-    Uses ProtoMotions' fk_from_transforms_with_velocities() to create
-    FK-consistent motion data — the same pipeline used to create .motion
-    files from AMASS. This guarantees all fields (positions, rotations,
-    dof_pos, velocities) are physically consistent.
+    Follows the same rotation conversion pipeline as ProtoMotions'
+    convert_amass_to_proto.py:
+      1. Extract SMPL local rotations from HML features
+      2. Compute SMPL global rotations (chain through SMPL tree)
+      3. Apply coordinate frame rotation (SMPL Y-up → Isaac Z-up)
+      4. Reorder globals to MJCF joint order
+      5. Extract MJCF-compatible joint rotations
+      6. Run FK for internally-consistent positions, rotations, velocities
 
     Returns path to the .motion file.
     """
     import re
-    from closd_isaaclab.utils.coord_transform import CoordTransform
+    from closd_isaaclab.utils.coord_transform import CoordTransform, smpl_2_mujoco
     from protomotions.components.pose_lib import (
         fk_from_transforms_with_velocities,
         extract_qpos_from_transforms,
         compute_angular_velocity,
+        compute_joint_rot_mats_from_global_mats,
     )
     from protomotions.utils.rotations import matrix_to_quaternion
 
@@ -531,32 +565,88 @@ def generate_motion_file(motion_provider, prompt, output_dir, rotation_solver):
     except Exception as e:
         log.warning("  Failed to render skeleton video: %s", e)
 
-    # Get local rotations from HML (20fps)
+    # Get local rotations from HML (20fps) — SMPL order, SMPL Y-up frame
     local_rot_mats, _, _ = rotation_solver.solve(None, hml_raw=hml_raw)
     T_20 = local_rot_mats.shape[1]
+    local_rot_smpl = local_rot_mats[0]  # [T_20, 24, 3, 3] in SMPL order
 
-    # Convert positions to Isaac coords for root_pos
+    # Convert diffusion positions to Isaac Z-up coords
     ct = CoordTransform()
     pos_isaac_20 = ct.smpl_to_isaac(positions_smpl[0])[:T_20]  # [T_20, 24, 3]
-    root_pos = pos_isaac_20[:, 0, :]  # [T_20, 3]
+    root_pos_isaac = pos_isaac_20[:, 0, :]  # [T_20, 3] — Z-up
 
-    # Use ProtoMotions' FK pipeline — guaranteed consistent
+    # ---------------------------------------------------------------
+    # Rotation pipeline: SMPL Y-up → Isaac Z-up (MJCF-compatible)
+    # ---------------------------------------------------------------
+    # Step 1: Compute SMPL global rotations (chain through SMPL tree)
+    global_rot_smpl = _smpl_globals_from_locals(local_rot_smpl)  # [T_20, 24, 3, 3]
+
+    # Step 2: Apply coordinate frame rotation as similarity transform
+    #   G_isaac = R_frame @ G_smpl @ R_frame^T
+    # where R_frame transforms SMPL positions to Isaac positions
+    R_frame = ct.rot_mat.float()  # [3, 3]
+    R_frame_T = R_frame.T
+    global_rot_isaac = R_frame @ global_rot_smpl @ R_frame_T  # [T_20, 24, 3, 3]
+
+    # Step 3: Reorder globals from SMPL order to MJCF order
+    smpl2mj = torch.tensor(smpl_2_mujoco, dtype=torch.long)
+    global_rot_mjcf = global_rot_isaac[:, smpl2mj]  # [T_20, 24, 3, 3]
+
+    # Step 4: Extract MJCF-compatible joint rotations
+    # (factors out MJCF reference rotations, which are identity for SMPL)
+    joint_rot_mjcf = compute_joint_rot_mats_from_global_mats(
+        ki, global_rot_mjcf
+    )  # [T_20, 24, 3, 3]
+
+    # Step 5: FK with Isaac root_pos and MJCF joint rotations
+    # Produces internally-consistent positions, rotations, velocities
     motion = fk_from_transforms_with_velocities(
-        ki, root_pos, local_rot_mats[0], fps=20, compute_velocities=True
+        ki, root_pos_isaac, joint_rot_mjcf, fps=20, compute_velocities=True
     )
 
-    # Local rotation quaternions for MotionLib interpolation
+    # Log FK vs diffusion position consistency
+    fk_pos = motion.rigid_body_pos  # [T_20, 24, 3]
+    fk_diff = (fk_pos - pos_isaac_20).norm(dim=-1).mean()
+    log.info("  FK vs diffusion position diff: %.4f m (mean per-joint)", fk_diff.item())
+
+    # ---------------------------------------------------------------
+    # Extract remaining fields for .motion file
+    # ---------------------------------------------------------------
+    # Use DIFFUSION positions for rigid_body_pos so the red ball markers
+    # match the diffusion skeleton video exactly (same source: recover_from_ric).
+    # Use FK-derived rotations for rigid_body_rot (correct facing direction
+    # from the rotation pipeline).
+    # The tracker weights positions (0.5) more than rotations (0.3), so it
+    # primarily follows the diffusion positions while maintaining correct
+    # orientation from the FK rotations.
+
+    # Fix height on diffusion positions: ensure feet above ground
+    min_z = pos_isaac_20[:, :, 2].min()
+    height_shift = max(0.015 - min_z.item(), 0.0)
+    pos_isaac_20_fixed = pos_isaac_20.clone()
+    pos_isaac_20_fixed[:, :, 2] += height_shift
+    if height_shift > 0:
+        log.info("  Height fix: shifted Z by %.4f m", height_shift)
+
+    # Diffusion-based velocities (finite difference on diffusion positions)
+    diff_vel = torch.zeros_like(pos_isaac_20_fixed)
+    if T_20 >= 3:
+        diff_vel[1:-1] = (pos_isaac_20_fixed[2:] - pos_isaac_20_fixed[:-2]) * (20 / 2)
+        diff_vel[0] = (pos_isaac_20_fixed[1] - pos_isaac_20_fixed[0]) * 20
+        diff_vel[-1] = (pos_isaac_20_fixed[-1] - pos_isaac_20_fixed[-2]) * 20
+
+    # Local rotation quaternions (MJCF order) for MotionLib interpolation
     local_rot_quat = matrix_to_quaternion(
-        local_rot_mats[0].reshape(-1, 3, 3), w_last=True
+        joint_rot_mjcf.reshape(-1, 3, 3), w_last=True
     ).reshape(T_20, 24, 4)
 
     # DOF positions and velocities
     qpos = extract_qpos_from_transforms(
-        ki, root_pos, local_rot_mats[0], multi_dof_decomposition_method="exp_map"
+        ki, root_pos_isaac, joint_rot_mjcf, multi_dof_decomposition_method="exp_map"
     )
     dof_pos = qpos[:, 7:]  # [T_20, 69]
-    dof_vel = compute_angular_velocity(local_rot_mats[0].unsqueeze(0), fps=20)
-    dof_vel = dof_vel[0, :, 1:, :].reshape(T_20, -1)  # [T_20, 69]
+    dof_vel = compute_angular_velocity(joint_rot_mjcf[:, 1:, :, :], fps=20)
+    dof_vel = dof_vel.reshape(T_20, -1)  # [T_20, 69]
 
     # Contacts from HML
     hml = hml_raw[0][:T_20]
@@ -572,17 +662,12 @@ def generate_motion_file(motion_provider, prompt, output_dir, rotation_solver):
     def _prepend_still(t, n):
         return torch.cat([t[0:1].expand(n, *t.shape[1:]), t])
 
-    # Use DIFFUSION positions (from recover_from_ric, reliable) for rigid_body_pos
-    # so red ball markers match the diffusion skeleton video.
-    # Use FK-derived rotations/velocities for tracker consistency.
-    diff_vel = torch.zeros_like(pos_isaac_20)
-    if T_20 >= 3:
-        diff_vel[1:-1] = (pos_isaac_20[2:] - pos_isaac_20[:-2]) * (20 / 2)
-        diff_vel[0] = (pos_isaac_20[1] - pos_isaac_20[0]) * 20
-        diff_vel[-1] = (pos_isaac_20[-1] - pos_isaac_20[-2]) * 20
-
+    # rigid_body_pos: diffusion positions (matches skeleton video)
+    # rigid_body_rot: FK-derived rotations (correct facing from rotation pipeline)
+    # rigid_body_vel: diffusion-based velocities (consistent with positions)
+    # rigid_body_ang_vel: FK-derived angular velocities (consistent with rotations)
     motion_dict = {
-        "rigid_body_pos": _prepend_still(pos_isaac_20, STAB),
+        "rigid_body_pos": _prepend_still(pos_isaac_20_fixed, STAB),
         "rigid_body_rot": _prepend_still(motion.rigid_body_rot, STAB),
         "rigid_body_vel": torch.cat([torch.zeros(STAB, 24, 3), diff_vel]),
         "rigid_body_ang_vel": torch.cat([torch.zeros(STAB, 24, 3), motion.rigid_body_ang_vel]),

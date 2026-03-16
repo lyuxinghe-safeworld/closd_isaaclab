@@ -222,8 +222,15 @@ class RotationSolver:
             # Recover root rotation from hml_raw via CLoSD's recover_root_rot_pos
             # recover_root_rot_pos returns (r_rot_quat, r_pos)
             # r_rot_quat: [bs, T, 4] in wxyz convention (CLoSD uses wxyz)
+            #
+            # IMPORTANT: HumanML3D convention — r_rot_quat represents the
+            # global→local (facing frame) rotation, i.e. it maps world-frame
+            # directions INTO the body's facing frame.  For the kinematic
+            # chain we need the INVERSE (local→global), which is the transpose
+            # of the rotation matrix.
             r_rot_quat, _ = recover_root_rot_pos(hml_raw)  # [bs, T, 4] wxyz
             root_mat = wxyz_quat_to_matrix(r_rot_quat)  # [bs, T, 3, 3]
+            root_mat = root_mat.transpose(-2, -1)  # invert: global→local → local→global
 
         # root_mat: [bs, T, 3, 3] -> unsqueeze joint dim
         root_mat = root_mat.unsqueeze(2)  # [bs, T, 1, 3, 3]
