@@ -572,10 +572,19 @@ def generate_motion_file(motion_provider, prompt, output_dir, rotation_solver):
     def _prepend_still(t, n):
         return torch.cat([t[0:1].expand(n, *t.shape[1:]), t])
 
+    # Use DIFFUSION positions (from recover_from_ric, reliable) for rigid_body_pos
+    # so red ball markers match the diffusion skeleton video.
+    # Use FK-derived rotations/velocities for tracker consistency.
+    diff_vel = torch.zeros_like(pos_isaac_20)
+    if T_20 >= 3:
+        diff_vel[1:-1] = (pos_isaac_20[2:] - pos_isaac_20[:-2]) * (20 / 2)
+        diff_vel[0] = (pos_isaac_20[1] - pos_isaac_20[0]) * 20
+        diff_vel[-1] = (pos_isaac_20[-1] - pos_isaac_20[-2]) * 20
+
     motion_dict = {
-        "rigid_body_pos": _prepend_still(motion.rigid_body_pos, STAB),
+        "rigid_body_pos": _prepend_still(pos_isaac_20, STAB),
         "rigid_body_rot": _prepend_still(motion.rigid_body_rot, STAB),
-        "rigid_body_vel": torch.cat([torch.zeros(STAB, 24, 3), motion.rigid_body_vel]),
+        "rigid_body_vel": torch.cat([torch.zeros(STAB, 24, 3), diff_vel]),
         "rigid_body_ang_vel": torch.cat([torch.zeros(STAB, 24, 3), motion.rigid_body_ang_vel]),
         "dof_pos": _prepend_still(dof_pos, STAB),
         "dof_vel": torch.cat([torch.zeros(STAB, 69), dof_vel]),
