@@ -584,7 +584,7 @@ def generate_motion_file(motion_provider, prompt, output_dir, rotation_solver):
         "fps": 20,
     }
 
-    motion_path = str(output_dir / "generated.motion")
+    motion_path = str((output_dir / "generated.motion").resolve())
     torch.save(motion_dict, motion_path)
     T_total = motion_dict["rigid_body_pos"].shape[0]
     log.info("  Saved .motion: %s (%d frames, %.1fs)", motion_path, T_total, T_total / 20)
