@@ -12,3 +12,6 @@ outputs/
 # IDE
 .vscode/
 .idea/
+
+# Worktrees
+.worktrees/
