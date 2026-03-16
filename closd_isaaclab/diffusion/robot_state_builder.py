@@ -63,71 +63,23 @@ def _rotation_between_vectors(v1: Tensor, v2: Tensor) -> Tensor:
     return R
 
 
-def _estimate_root_rotation(
-    positions: Tensor,
-    l_hip_idx: int,
-    r_hip_idx: int,
-    torso_idx: int = -1,
-) -> Tensor:
-    """Estimate the root (pelvis) global rotation from hip and spine positions.
-
-    Constructs the pelvis body frame from three anatomical cues:
-      - **Lateral axis**: L_Hip → R_Hip direction (left-to-right).
-      - **Up axis**: pelvis centre → Torso direction (captures forward lean
-        and side lean instead of assuming world-Z).
-      - **Forward axis**: cross(lateral, up), then re-orthogonalise.
-
-    When *torso_idx* is unavailable (< 0) or the pelvis→torso vector is
-    degenerate, falls back to world-Z as the up direction (yaw-only).
+def _procrustes_rotation(source: Tensor, target: Tensor) -> Tensor:
+    """Solve for rotation R minimizing ||R @ source - target||² via SVD.
 
     Args:
-        positions: [T, num_bodies, 3] world-frame joint positions.
-        l_hip_idx: Body index of L_Hip in MJCF order.
-        r_hip_idx: Body index of R_Hip in MJCF order.
-        torso_idx: Body index of Torso (direct child of Pelvis) in MJCF
-                   order.  Set to -1 to use the yaw-only fallback.
+        source: [T, N, 3] points in the source frame.
+        target: [T, N, 3] points in the target frame.
 
     Returns:
-        [T, 3, 3] root rotation matrices (columns = [forward, lateral, up]).
+        [T, 3, 3] optimal rotation matrices.
     """
-    T = positions.shape[0]
-    eps = 1e-8
-
-    # --- lateral axis (L_Hip → R_Hip) ---
-    lateral = positions[:, l_hip_idx] - positions[:, r_hip_idx]  # [T, 3]
-    lateral = lateral / (lateral.norm(dim=-1, keepdim=True) + eps)
-
-    # --- up axis ---
-    if torso_idx >= 0:
-        # Pelvis centre = midpoint of hips (more robust than body-0 position
-        # which may be at a slightly different location in some MJCF files).
-        pelvis_centre = (
-            positions[:, l_hip_idx] + positions[:, r_hip_idx]
-        ) / 2.0  # [T, 3]
-        up_raw = positions[:, torso_idx] - pelvis_centre  # [T, 3]
-        up_norm = up_raw.norm(dim=-1, keepdim=True)
-
-        # Fallback per-frame: if pelvis→torso is degenerate, use world Z
-        degenerate = (up_norm < 1e-4).squeeze(-1)  # [T]
-        up_raw = up_raw / (up_norm + eps)
-        if degenerate.any():
-            world_z = torch.zeros_like(up_raw)
-            world_z[:, 2] = 1.0
-            up_raw[degenerate] = world_z[degenerate]
-    else:
-        up_raw = torch.zeros(T, 3, device=positions.device, dtype=positions.dtype)
-        up_raw[:, 2] = 1.0
-
-    # --- forward = lateral × up  (then orthogonalise) ---
-    forward = torch.linalg.cross(lateral, up_raw)  # [T, 3]
-    forward = forward / (forward.norm(dim=-1, keepdim=True) + eps)
-
-    # Recompute up & lateral for strict orthogonality
-    up = torch.linalg.cross(forward, lateral)
-    up = up / (up.norm(dim=-1, keepdim=True) + eps)
-    lateral = torch.linalg.cross(up, forward)
-
-    return torch.stack([forward, lateral, up], dim=-1)  # [T, 3, 3]
+    H = torch.bmm(source.transpose(-1, -2), target)  # [T, 3, 3]
+    U, S, Vh = torch.linalg.svd(H)
+    det = torch.det(torch.bmm(Vh.transpose(-1, -2), U.transpose(-1, -2)))
+    sign = torch.ones(source.shape[0], 3, device=source.device, dtype=source.dtype)
+    sign[:, -1] = det.sign()
+    R = torch.bmm(Vh.transpose(-1, -2) * sign.unsqueeze(-2), U.transpose(-1, -2))
+    return R
 
 
 def analytical_ik(
@@ -137,9 +89,10 @@ def analytical_ik(
 ) -> Tensor:
     """Compute global rotation matrices from positions via analytical IK.
 
-    Walks the MJCF kinematic tree from root to leaves, computing per-body
-    rotations from bone direction vectors.  Uses hip-based root rotation
-    estimation to avoid twist accumulation in the spine chain.
+    For each body, solves for the rotation that maps rest-pose child bone
+    vectors to actual child bone vectors.  Uses Procrustes (SVD) for bodies
+    with 2+ children and bone-direction + grandchild twist refinement for
+    single-child bodies.
 
     Parameters
     ----------
@@ -160,55 +113,124 @@ def analytical_ik(
     n_input = positions.shape[1]
     dev = positions.device
 
-    # Guard: positions must have at least num_bodies joints
     if n_input < nb:
         raise ValueError(
             f"analytical_ik expects {nb}-body positions (MJCF order), "
             f"got {n_input} joints. Convert to Isaac space first via CoordTransform."
         )
 
-    global_rots = torch.eye(3, device=dev).unsqueeze(0).expand(T, nb, 3, 3).clone()
-
-    # Estimate root rotation from hip + torso positions
-    l_hip_idx = ki.body_names.index("L_Hip")
-    r_hip_idx = ki.body_names.index("R_Hip")
-    torso_idx = ki.body_names.index("Torso") if "Torso" in ki.body_names else -1
-    global_rots[:, 0] = _estimate_root_rotation(
-        positions, l_hip_idx, r_hip_idx, torso_idx=torso_idx,
-    )
-
+    # Build children map
+    children_map: dict[int, list[int]] = {i: [] for i in range(nb)}
     for i in range(nb):
         pi = ki.parent_indices[i]
-        if pi < 0:
-            continue  # root rotation already set above
+        if pi >= 0:
+            children_map[pi].append(i)
 
-        parent_rot = global_rots[:, pi]  # [T, 3, 3]
+    global_rots = torch.eye(3, device=dev).unsqueeze(0).expand(T, nb, 3, 3).clone()
 
-        # Actual bone in parent's local frame
-        actual_bone_world = positions[:, i] - positions[:, pi]  # [T, 3]
-        actual_bone_local = torch.bmm(
-            parent_rot.transpose(-1, -2), actual_bone_world.unsqueeze(-1)
-        ).squeeze(-1)
+    # Process in topological order (MJCF indices are already topological)
+    for i in range(nb):
+        child_list = children_map[i]
 
-        # Rest bone in parent's local frame (from MJCF)
-        rest_bone_local = ki.local_pos[i].to(dev)  # [3]
+        if not child_list:
+            # Leaf body: use bone-direction from parent
+            pi = ki.parent_indices[i]
+            if pi >= 0:
+                parent_rot = global_rots[:, pi]
+                ref_rot = ki.local_rot_ref_mat[i].to(dev)
+                actual_bone_world = positions[:, i] - positions[:, pi]
+                actual_bone_local = torch.bmm(
+                    parent_rot.transpose(-1, -2),
+                    actual_bone_world.unsqueeze(-1),
+                ).squeeze(-1)
+                rest_bone_local = ki.local_pos[i].to(dev)
+                if rest_bone_local.norm() > 1e-6:
+                    local_rot = _rotation_between_vectors(
+                        rest_bone_local.unsqueeze(0).expand(T, -1),
+                        actual_bone_local,
+                    )
+                else:
+                    local_rot = torch.eye(3, device=dev).unsqueeze(0).expand(T, 3, 3)
+                global_rots[:, i] = torch.bmm(
+                    torch.bmm(parent_rot, ref_rot.unsqueeze(0).expand(T, 3, 3)),
+                    local_rot,
+                )
+            continue
 
-        if rest_bone_local.norm() > 1e-6:
-            local_rot = _rotation_between_vectors(
-                rest_bone_local.unsqueeze(0).expand(T, -1),
-                actual_bone_local,
-            )  # [T, 3, 3]
+        # Non-leaf: solve for rotation using children's positions.
+        # FK: pos[child] = pos[i] + global_rots[i] @ local_pos[child]
+        # Solve: R such that R @ rest_bone[c] ≈ actual_bone[c] for all children c.
+
+        rest_bones = []
+        actual_bones = []
+        for c in child_list:
+            rest_bones.append(ki.local_pos[c].to(dev))
+            actual_bones.append(positions[:, c] - positions[:, i])
+
+        if len(child_list) >= 2:
+            # Procrustes with all children
+            source = torch.stack(rest_bones, dim=0).unsqueeze(0).expand(T, -1, -1)
+            target = torch.stack(actual_bones, dim=1)
+            global_rots[:, i] = _procrustes_rotation(source, target)
         else:
-            local_rot = torch.eye(3, device=dev).unsqueeze(0).expand(T, 3, 3)
+            # Single child: bone-direction + grandchild twist refinement
+            rest_bone = rest_bones[0]
+            actual_bone = actual_bones[0]
 
-        # Include reference rotation from MJCF
-        ref_rot = ki.local_rot_ref_mat[i].to(dev)  # [3, 3]
+            R_dir = _rotation_between_vectors(
+                rest_bone.unsqueeze(0).expand(T, -1),
+                actual_bone,
+            )
+            global_rots[:, i] = R_dir
 
-        # Global rotation: parent_rot @ ref_rot @ local_rot
-        global_rots[:, i] = torch.bmm(
-            torch.bmm(parent_rot, ref_rot.unsqueeze(0).expand(T, 3, 3)),
-            local_rot,
-        )
+            # Twist refinement using grandchild
+            gc_list = children_map[child_list[0]]
+            if gc_list:
+                gc = gc_list[0]
+                # Rest-pose: pos[gc] - pos[i] = R_i @ (local_pos[child] + ref_rot[child] @ local_pos[gc])
+                # (assuming joint_rot[child] = identity in rest pose)
+                ref_rot_c = ki.local_rot_ref_mat[child_list[0]].to(dev)
+                gc_rest_from_i = rest_bone + ref_rot_c @ ki.local_pos[gc].to(dev)
+                gc_actual_from_i = positions[:, gc] - positions[:, i]
+
+                # Project onto plane perpendicular to bone axis
+                bone_axis = actual_bone / (actual_bone.norm(dim=-1, keepdim=True) + 1e-8)
+                gc_actual_proj = gc_actual_from_i - (gc_actual_from_i * bone_axis).sum(dim=-1, keepdim=True) * bone_axis
+                gc_rest_rotated = torch.bmm(R_dir, gc_rest_from_i.unsqueeze(0).expand(T, -1).unsqueeze(-1)).squeeze(-1)
+                gc_rest_proj = gc_rest_rotated - (gc_rest_rotated * bone_axis).sum(dim=-1, keepdim=True) * bone_axis
+
+                proj_actual_norm = gc_actual_proj.norm(dim=-1)
+                proj_rest_norm = gc_rest_proj.norm(dim=-1)
+                valid = (proj_actual_norm > 1e-4) & (proj_rest_norm > 1e-4)
+
+                if valid.any():
+                    gc_actual_proj_n = gc_actual_proj / (proj_actual_norm.unsqueeze(-1) + 1e-8)
+                    gc_rest_proj_n = gc_rest_proj / (proj_rest_norm.unsqueeze(-1) + 1e-8)
+
+                    cos_twist = (gc_actual_proj_n * gc_rest_proj_n).sum(dim=-1).clamp(-1, 1)
+                    cross_twist = torch.cross(gc_rest_proj_n, gc_actual_proj_n, dim=-1)
+                    sin_twist = (cross_twist * bone_axis).sum(dim=-1).clamp(-1, 1)
+                    twist_angle = torch.atan2(sin_twist, cos_twist)
+
+                    # Axis-angle twist rotation
+                    ax = bone_axis
+                    c_t = torch.cos(twist_angle).unsqueeze(-1).unsqueeze(-1)
+                    s_t = torch.sin(twist_angle).unsqueeze(-1).unsqueeze(-1)
+                    ax_x, ax_y, ax_z = ax[:, 0], ax[:, 1], ax[:, 2]
+                    z = torch.zeros_like(ax_x)
+                    K_twist = torch.stack([
+                        torch.stack([z, -ax_z, ax_y], dim=-1),
+                        torch.stack([ax_z, z, -ax_x], dim=-1),
+                        torch.stack([-ax_y, ax_x, z], dim=-1),
+                    ], dim=-2)
+                    I3 = torch.eye(3, device=dev).unsqueeze(0).expand(T, 3, 3)
+                    R_twist = I3 * c_t + K_twist * s_t + torch.bmm(
+                        ax.unsqueeze(-1), ax.unsqueeze(-2)
+                    ) * (1 - c_t)
+
+                    for t_idx in range(T):
+                        if valid[t_idx]:
+                            global_rots[t_idx, i] = R_twist[t_idx] @ R_dir[t_idx]
 
     return global_rots
 
