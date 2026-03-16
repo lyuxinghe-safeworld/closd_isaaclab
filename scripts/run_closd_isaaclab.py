@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import sys
 from pathlib import Path
 
@@ -353,6 +354,15 @@ def build_protomotions_env_and_agent(
     scene_lib_config = tracker_configs["scene_lib"]
     env_config = tracker_configs["env"]
     agent_config = tracker_configs["agent"]
+
+    # --- Make robot asset path absolute (resolves relative USD path issue) ---
+    asset_root = getattr(robot_config.asset, "asset_root", "")
+    if asset_root and not os.path.isabs(asset_root):
+        import protomotions
+        proto_root = Path(protomotions.__file__).parent.parent
+        abs_root = str(proto_root / asset_root)
+        log.info("  asset_root: %s -> %s", asset_root, abs_root)
+        robot_config.asset.asset_root = abs_root
 
     # --- Apply overrides ---
     simulator_config.num_envs = args.num_envs
