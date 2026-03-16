@@ -467,15 +467,56 @@ def build_protomotions_env_and_agent(
 # Phase 6: Closed-loop execution
 # ===================================================================
 
-def run_closed_loop(env, agent, closd_manager, args):
+def generate_initial_motion(motion_provider, robot_state_builder, prompt, device):
+    """Generate initial diffusion motion and populate the RobotStateBuilder.
+
+    This must be called before the tracking loop so that CLoSDMotionLib
+    has real motion data to serve (not zeros).
+    """
+    import numpy as np
+    from closd_isaaclab.utils.coord_transform import CoordTransform
+    from closd_isaaclab.utils.fps_convert import fps_convert
+    from closd_isaaclab.diffusion.rotation_solver import cont6d_to_matrix, wxyz_quat_to_matrix
+    from closd_isaaclab.diffusion.hml_conversion import recover_root_rot_pos
+    from protomotions.utils.rotations import matrix_to_quaternion, quat_to_exp_map
+
+    log.info("Generating initial diffusion motion for: '%s'", prompt)
+    positions_smpl, hml_raw = motion_provider.generate_standalone(prompt, num_seconds=8.0)
+    positions_smpl = positions_smpl.cpu()
+    hml_raw = hml_raw.cpu()
+    log.info("  Generated: %s positions, %s HML", list(positions_smpl.shape), list(hml_raw.shape))
+
+    ct = CoordTransform()
+    T_20 = positions_smpl.shape[1]
+    dt = 1.0 / 30.0
+
+    # Positions: SMPL 22-joint -> Isaac 24-joint, 20fps -> 30fps
+    pos_isaac_20 = ct.smpl_to_isaac(positions_smpl[0])
+    pos_isaac_30 = fps_convert(pos_isaac_20.unsqueeze(0), 20, 30)[0]
+
+    # Build the robot_state_builder with positions (and HML for rotations)
+    # Upsample hml_raw to match 30fps frame count for contact extraction
+    robot_state_builder.build(
+        pos_isaac_30.unsqueeze(0).to(device),
+        hml_raw.to(device),
+    )
+
+    T_30 = pos_isaac_30.shape[0]
+    log.info("  RobotStateBuilder populated: %d frames at 30fps (%.1fs)", T_30, T_30 / 30.0)
+
+    # Update motion_lib lengths to match generated motion
+    return T_30
+
+
+def run_closed_loop(env, agent, closd_manager, motion_provider, robot_state_builder, closd_motion_lib, args):
     """Run the closed-loop CLoSD pipeline.
 
-    Steps per sim step:
-      1. Agent selects action from policy (conditioned on ref motion from CLoSDMotionLib)
-      2. Env steps physics
-      3. CLoSDMotionManager.post_physics_step() advances time, updates pose buffer,
-         and triggers diffusion replanning when the horizon expires
+    Steps:
+      1. Generate initial diffusion motion and populate RobotStateBuilder
+      2. Run ProtoMotions policy loop (tracker queries CLoSDMotionLib for reference)
     """
+    device = next(iter(env.simulator._robot.data.body_pos_w.device for _ in [0]))
+
     log.info("=" * 60)
     log.info("Starting closed-loop CLoSD pipeline")
     log.info("  prompt         : %s", args.prompt)
@@ -483,38 +524,21 @@ def run_closed_loop(env, agent, closd_manager, args):
     log.info("  num_envs       : %d", args.num_envs)
     log.info("=" * 60)
 
-    # TODO: Wire closd_manager.get_body_positions_fn to the simulator's
-    # body position query. This depends on the specific simulator API:
-    #   - IsaacLab: env.simulator.get_body_positions()
-    #   - IsaacGym: env.simulator.rigid_body_pos
-    # The exact method name needs to be identified from the env/simulator instance.
-    #
-    # Example wiring:
-    #   closd_manager.get_body_positions_fn = lambda: env.simulator.get_body_positions()
-
-    # TODO: Replace the env's motion_manager with closd_manager so that
-    # the mimic env uses CLoSD-generated reference motions. The exact attribute
-    # name depends on the env class. Candidates:
-    #   env.motion_manager = closd_manager
-    #   env.mimic_motion_manager = closd_manager
-    # Inspect env.__dict__ or env.__class__.__mro__ to find the right attribute.
-
-    log.info(
-        "NOTE: The closed-loop wiring requires iterative debugging. "
-        "Running agent.evaluator.simple_test_policy() as the inference entry point."
+    # Phase 6a: Generate initial motion and populate builder
+    num_frames = generate_initial_motion(
+        motion_provider, robot_state_builder, args.prompt, device
     )
 
-    # This runs the standard ProtoMotions inference loop, which will query
-    # closd_motion_lib for reference states. With proper wiring, the
-    # CLoSDMotionManager's post_physics_step hook will trigger replanning.
+    # Update motion_lib duration so get_done_tracks works correctly
+    closd_motion_lib.motion_lengths = torch.tensor(
+        [num_frames / 30.0], device=device
+    )
+
+    log.info("Running tracker policy...")
     try:
         agent.evaluator.simple_test_policy(collect_metrics=True)
     except Exception as e:
         log.error("Inference loop failed: %s", e)
-        log.error(
-            "This is expected during initial integration. "
-            "See TODO markers for wiring that needs refinement."
-        )
         raise
 
 
@@ -630,7 +654,11 @@ def main():
     )
 
     # Phase 6: Run closed-loop
-    run_closed_loop(env, agent, closd_manager, args)
+    run_closed_loop(
+        env, agent, closd_manager,
+        motion_provider, robot_state_builder, closd_motion_lib,
+        args,
+    )
 
 
 if __name__ == "__main__":
