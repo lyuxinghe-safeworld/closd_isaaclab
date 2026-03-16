@@ -41,29 +41,43 @@ The tracker expects `RobotState` from `MotionLib.get_motion_state()`, which prov
 
 ### Quaternion Convention Map
 
-All quaternion handoffs must be explicit:
+All quaternion handoffs must be explicit. Isaac Sim's convention is **API-dependent**, not globally one format:
 
-| System | Convention | Notes |
-|--------|-----------|-------|
-| HumanML3D / CLoSD internals | **wxyz** | `recover_root_rot_pos()` puts w at index 0; `qmul`/`qinv` in CLoSD assume wxyz |
-| Isaac Gym (CLoSD sim) | **xyzw** | Isaac Gym Preview uses xyzw |
-| ProtoMotions COMMON | **xyzw** | All algorithm-layer data; `RobotState` with `StateConversion.COMMON` |
-| ProtoMotions SIM (Isaac Lab) | **wxyz** | Isaac Lab/PhysX uses wxyz; `DataConversionMapping.sim_w_last=False` auto-converts |
+| System | Convention | Source |
+|--------|-----------|--------|
+| HumanML3D / CLoSD internals | **wxyz** | `recover_root_rot_pos()` puts w at index 0 (line 15); `qmul`/`qinv` assume wxyz |
+| Isaac Gym API (`gymapi.Quat`) | **xyzw** | Isaac Gym docs: `(x, y, z, w)` |
+| Isaac Sim Core / USD / IsaacLab high-level | **wxyz** | `body_quat_w`, `root_quat_w` return wxyz |
+| Isaac Sim PhysX / Dynamic Control low-level | **xyzw** | PhysX tensor convention |
+| ProtoMotions COMMON (algorithm layer) | **xyzw** | `StateConversion.COMMON`; all policy/obs code uses xyzw |
+| ProtoMotions SIM (IsaacLab) | **wxyz** | `config.w_last=False` in `isaaclab/config.py:76`; triggers auto wxyz↔xyzw conversion |
 
 **Conversion points**:
 - `hml_conversion.py`: internal math uses wxyz (matching CLoSD). `recon_data` stores wxyz quaternions.
-- `robot_state_builder.py`: converts CLoSD wxyz → ProtoMotions xyzw before constructing `RobotState(state_conversion=COMMON)`.
-- ProtoMotions' `DataConversionMapping` handles xyzw↔wxyz for sim I/O automatically.
+- `robot_state_builder.py`: converts CLoSD wxyz → ProtoMotions xyzw via `q[..., [1,2,3,0]]` before constructing `RobotState(state_conversion=COMMON)`.
+- ProtoMotions' `DataConversionMapping` handles xyzw↔wxyz for sim I/O automatically (verified: `sim_w_last=False` triggers `wxyz_to_xyzw` on read, `xyzw_to_wxyz` on write).
+
+### SMPL Humanoid Asset Equivalence
+
+The public USDA (`smpl_humanoid.usda`) is a faithful conversion of the CLoSD MJCF (`smpl_humanoid_0.xml`):
+- **Body names/order**: Identical 24-body hierarchy in the same depth-first order (Pelvis, L_Hip, L_Knee, ... R_Hand)
+- **Local offsets**: Match within float formatting (e.g., L_Hip: XML `(-0.0068, 0.0695, -0.0914)` vs USDA `(-0.0068000006, 0.0695, -0.0914)`)
+- **Joint axes**: USDA preserves original MJCF axis names via `mjcf:rotX:name = "L_Hip_x"` etc.
+- **PD gains**: Match exactly (hips 800/80, toes 500/50, torso/spine/chest 1000/100, shoulders 500/50, wrists/hands 300/30)
+- **Local rotations**: All USDA `localRot0`/`localRot1` are identity quaternions `(1, 0, 0, 0)`
+- **Runtime ordering**: Should still be queried via `Articulation.data.body_names` / `joint_names` as IsaacLab may reorder. ProtoMotions' `DataConversionMapping` handles this transparently.
+- **DOF encoding**: USDA stores 23 joints × 3 rotational axes (not 69 standalone hinge prims), so DOF ordering is more likely than body ordering to differ at runtime.
 
 ### Key Porting Challenges
 
 | Issue | Isaac Gym (CLoSD) | Isaac Lab (ProtoMotions) |
 |-------|-------------------|--------------------------|
-| Quaternion convention | wxyz (CLoSD internals), xyzw (Isaac Gym API) | wxyz (sim), xyzw (common) |
-| Joint ordering | Depth-first (MJCF) | Breadth-first (USD), remapped via `DataConversionMapping` |
-| Body names | Identical 24-body SMPL hierarchy | Same names, runtime reordering handled by ProtoMotions |
-| PD control | `gym.set_dof_position_target_tensor()` | `ImplicitActuatorCfg` or `robot.set_joint_position_target()` |
-| FPS | Diffusion 20fps, sim 30fps | Configurable via `sim.dt` + `decimation` |
+| Quaternion convention | wxyz (CLoSD internals), xyzw (Isaac Gym API) | wxyz (IsaacLab high-level), xyzw (PhysX low-level, ProtoMotions common) |
+| Joint ordering | Depth-first (MJCF), 69 hinge DOFs | File-level identical; runtime: 23 joints × 3 axes, verify via `DataConversionMapping` |
+| PD control | `gym.set_dof_position_target_tensor()` | `ImplicitActuatorCfg` / `robot.set_joint_position_target()` |
+| Physics config | 30fps direct | fps=120, decimation=4 (=30Hz effective control). `max_angular_velocity=1000`, `angular_damping=0.0` |
+| FPS | Diffusion 20fps, sim 30fps | Same 30Hz effective control rate |
+| Velocity semantics | `acquire_rigid_body_state_tensor` returns body-origin (actor-frame) velocities | `body_lin_vel_w` / `body_ang_vel_w` may return COM-frame velocities (see Risks) |
 | Height offset | `offset_height = 0.92` (Y-up), `offset = 0.0` in CLoSD rep_util.py | Z-up; configurable in `coord_transform.py` |
 
 ## 3. Architecture
@@ -167,9 +181,12 @@ Ported from CLoSD's `rep_util.py` and `motion_process_torch.py`. Two core functi
   3. Apply sim's `recon_data`: rotate by sim root rotation, add sim root XZ position → motion placed at sim's actual world position
   This ensures seamless stitching between prediction and current sim state.
 - 22→24 joints (add hands by extending wrist direction)
-- SMPL → Isaac coordinate transform + joint reorder
+- **Full transform to simulator body-state space** (unlike CLoSD which stops at intermediate reference-pose space):
+  - Apply `smpl2sim_rot_mat` (Rx(-pi)) + `y180_rot` (Ry(pi)) + offset (= CLoSD's `smpl_to_sim()`)
+  - Apply `to_isaac_mat.T` (Rx(-pi/2).T) (= CLoSD's `_get_state_from_gen_cache()` line 704)
+  - Reorder joints: SMPL → MuJoCo via `smpl_2_mujoco`
 - 20fps → 30fps bicubic upsampling
-- Output: `[bs, T_30fps, 24, 3]`
+- Output: `[bs, T_30fps, 24, 3]` in **simulator body-state space** (Z-up, MuJoCo joint order, world frame)
 
 #### 3.3 `diffusion/rotation_solver.py` — Rotation Derivation
 
@@ -291,6 +308,18 @@ A ProtoMotions experiment file that wires everything together:
 - MotionLib: `CLoSDMotionLib` (custom, wraps diffusion)
 - Control: `MimicControl` with appropriate `num_future_steps`
 - Observations: Same as the pretrained tracker's config (loaded from `resolved_configs_inference.pt`)
+
+### Three Coordinate Spaces
+
+There are three distinct coordinate spaces in play. Confusing them is the most likely source of silent bugs:
+
+1. **HumanML3D / SMPL-internal space**: Y-up, SMPL joint order (22 joints), egocentric (root-relative, rotation-invariant). Used inside the diffusion model.
+
+2. **Cached reference-pose space** (`[x, -z, y]` in SMPL 24-joint order): The output of `hml_to_pose()`. This is an intermediate space — `smpl_to_sim()` has applied `smpl2sim_rot_mat` and `y180_rot`, but NOT the final `to_isaac_mat` rotation. CLoSD caches the planning horizon in this space. **The naming in CLoSD is inconsistent**: `hml_to_pose()` comments say "smpl xyz" but the task code treats the output as this intermediate reference space (see `closd.py:340` comment `# [x, -z, y]`).
+
+3. **Simulator body-state space**: Z-up, MuJoCo joint order (24 joints), world frame. Final Isaac Gym/Lab coordinates. `_get_state_from_gen_cache()` converts from reference-pose space to this via: `smpl_2_mujoco` joint reorder + `to_isaac_mat.T` multiplication (closd.py:656,704).
+
+**For our port**: We can either (a) replicate CLoSD's two-stage approach (cache in reference-pose space, convert on consumption), or (b) simplify by converting all the way to simulator space in `hml_to_pose()` and caching that. Option (b) is simpler since ProtoMotions expects world-frame `RobotState`. We choose (b): `hml_conversion.py`'s `hml_to_pose()` will apply the full transform chain including `to_isaac_mat` and joint reordering, outputting directly in the simulator's body-state space.
 
 ### Coordinate Transform Constants
 
@@ -551,3 +580,5 @@ numpy
 | Isaac Lab joint ordering differs from Isaac Gym | Actions/observations sent to wrong joints | ProtoMotions' `DataConversionMapping` handles this automatically |
 | Quaternion convention mismatch | Silent wrong orientations | All conversions explicitly documented with convention table; ProtoMotions auto-converts between wxyz (sim) and xyzw (common) |
 | Diffusion produces NaN or degenerate output | Tracker falls, episode ruined | Check for NaN after each diffusion call; if detected, repeat last valid horizon and log warning. If FK error > 10cm, also fall back to last valid horizon |
+| Actor-frame vs COM-frame velocity mismatch | Velocity observations silently wrong, degraded tracking | Isaac Gym returns body-origin velocities via `acquire_rigid_body_state_tensor`; IsaacLab's `body_lin_vel_w` may return COM-frame velocities. ProtoMotions' tracker was trained on IsaacLab data, so this is consistent for the tracker side. But our diffusion-derived reference velocities (finite-differenced from body positions) are body-origin velocities. For SMPL's capsule/box geometries the COM offset is small, so the mismatch should be minor. Validate by comparing reference vs sim velocities during `verify_tracking.py`. |
+| Reference-pose-space confusion | Positions fed to tracker in wrong coordinate frame | CLoSD caches planning horizon in intermediate `[x, -z, y]` space (not final Isaac coords). Our design converts fully to sim space in `hml_to_pose()` to avoid this. Verify via `test_coord_transform.py` round-trip tests. |
